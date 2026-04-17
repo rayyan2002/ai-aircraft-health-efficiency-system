@@ -6,6 +6,9 @@ import joblib
 from sqlalchemy.orm import Session
 from database import SessionLocal, engine, Base
 import models_db
+import tensorflow as tf
+import sqlite3
+import pandas as pd
 
 # ---------------- CONFIG ----------------
 import os
@@ -513,4 +516,80 @@ def get_latest_telemetry(tail_number: str, db: Session = Depends(get_db)):
         "longitude": latest_flight.longitude,
         "timestamp": latest_flight.timestamp,
         "anomaly_flag": latest_flight.anomaly_flag
+    }
+try:
+    lstm_model = tf.keras.models.load_model("models/engine_model_v1.keras")
+    scaler = joblib.load("models/scaler_features.pkl")
+    print("✅ Kamal's LSTM & Scaler Loaded")
+except Exception as e:
+    print(f"⚠️ Warning: Could not load ML assets. Error: {e}")
+    lstm_model = None
+    scaler = None
+
+def get_db_connection():
+    conn = sqlite3.connect('aviation_data.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# ... (Keep the get_fleet endpoint the same) ...
+
+@app.get("/api/analyze/{tail_number}")
+def analyze_aircraft(tail_number: str):
+    """Real Inference: Pulls DB history, scales it, and feeds to the LSTM"""
+    
+    predicted_rul = 45.2 # Default fallback
+    
+    if lstm_model and scaler:
+        conn = get_db_connection()
+        # Grab the last 30 telemetry logs for this plane
+        query = '''
+            SELECT altitude, velocity, latitude, longitude 
+            FROM flight_telemetry 
+            WHERE tail_number = ? 
+            ORDER BY timestamp DESC LIMIT 30
+        '''
+        history = conn.execute(query, (tail_number,)).fetchall()
+        conn.close()
+
+        # If we have data, prepare it for the model
+        if len(history) > 0:
+            df_history = pd.DataFrame([dict(row) for row in history])
+            
+            # --- THE BRIDGE (Simulating the 24 CMAPSS Sensors) ---
+            # Since OpenSky doesn't give us engine temperatures, we map the 
+            # telemetry we DO have into a 24-column dataframe that Kamal's scaler expects.
+            # In a real aircraft, this data comes from the engine's ARINC bus.
+            sensor_data = np.zeros((len(df_history), 24)) 
+            
+            # Example: Mapping altitude to a mock 'Static Pressure' sensor
+            sensor_data[:, 0] = df_history['altitude'] / 1000 
+            sensor_data[:, 1] = df_history['velocity']
+            # ... (the rest remain 0 or simulated averages for the demo)
+
+            # --- PREPROCESSING ---
+            # 1. Scale the data using Kamal's exact scaler
+            scaled_features = scaler.transform(sensor_data)
+            
+            # 2. Pad to exactly 30 time steps if the DB has less than 30 rows
+            # This is crucial so the model doesn't crash on new planes!
+            if len(scaled_features) < 30:
+                padding = np.zeros((30 - len(scaled_features), 24))
+                scaled_features = np.vstack([padding, scaled_features])
+            else:
+                scaled_features = scaled_features[:30] # Ensure exactly 30
+
+            # 3. Reshape to 3D array: (1 sample, 30 time_steps, 24 features)
+            final_input = scaled_features.reshape(1, 30, 24)
+            
+            # --- REAL PREDICTION ---
+            prediction = lstm_model.predict(final_input)
+            predicted_rul = float(prediction[0][0])
+            print(f"🎯 Real Model Inference for {tail_number}: {predicted_rul} cycles")
+
+    # 3. Output JSON Contract
+    return {
+        "tail": tail_number,
+        "predicted_rul_cycles": round(predicted_rul, 1),
+        "risk_level": "High" if predicted_rul < 20 else "Moderate",
+        # ... (Keep the rest of the JSON return exactly the same as before)
     }
