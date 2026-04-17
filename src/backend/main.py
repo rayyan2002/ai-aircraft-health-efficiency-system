@@ -43,7 +43,7 @@ except ImportError:
 # ──────────────────────────────────────────────────────────────────────────────
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, "..", ".."))
-MODELS_DIR   = os.path.join(PROJECT_ROOT, "models")
+MODELS_DIR = os.path.join(PROJECT_ROOT, "src", "models")
 
 IF_MODEL_PATH     = os.path.join(MODELS_DIR, "adsb_iforest.pkl")
 IF_SCALER_PATH    = os.path.join(MODELS_DIR, "adsb_if_scaler.pkl")
