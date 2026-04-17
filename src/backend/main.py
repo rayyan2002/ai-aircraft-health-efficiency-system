@@ -1,15 +1,65 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
 import numpy as np
 import joblib
+from sqlalchemy.orm import Session
+from database import SessionLocal, engine, Base
+import models_db
 
 # ---------------- CONFIG ----------------
-IF_MODEL_PATH = "models/adsb_iforest.pkl"
-SCALER_PATH   = "models/adsb_if_scaler.pkl"
+import os
 
-CMAPSS_MODEL_PATH = "models/cmapss_health_rf.pkl"
+# ---------------- 1. PATH CONFIGURATION (The Fix) ----------------
+# Get the directory where THIS file (main.py) is located
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Build robust absolute paths to the models
+IF_MODEL_PATH = os.path.join(BASE_DIR, "models", "adsb_iforest.pkl")
+SCALER_PATH   = os.path.join(BASE_DIR, "models", "adsb_if_scaler.pkl")
+CMAPSS_MODEL_PATH = os.path.join(BASE_DIR, "models", "cmapss_health_rf.pkl")
+# This line is MAGIC. It tells SQLAlchemy: "Look at models_db.py, 
+# and if those tables don't exist in the database yet, create them now!"
+models_db.Base.metadata.create_all(bind=engine)
+
+# ---------------- 2. APP INITIALIZATION ----------------
+app = FastAPI(
+    title="Aircraft Health & Efficiency Dashboard ",
+    description="ADS-B anomaly + CMAPSS engine health services",
+    version="1.0.0",
+)
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ---------------- 3. LOAD MODELS ----------------
+if_model = None
+scaler = None
+cmapss_model = None
+
+# ADS-B Models
+try:
+    if_model = joblib.load(IF_MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
+    print(f"✅ SUCCESS: Isolation Forest loaded from {IF_MODEL_PATH}")
+except Exception as e:
+    print(f"❌ CRITICAL ERROR: Could not load ADS-B Model.")
+    print(f"   Checked path: {IF_MODEL_PATH}")
+    print(f"   Details: {e}")
+
+# CMAPSS Model
+try:
+    cmapss_model = joblib.load(CMAPSS_MODEL_PATH)
+    print(f"✅ SUCCESS: CMAPSS Health Model loaded from {CMAPSS_MODEL_PATH}")
+except Exception as e:
+    print(f"❌ CRITICAL ERROR: Could not load CMAPSS Model.")
+    print(f"   Checked path: {CMAPSS_MODEL_PATH}")
+    print(f"   Details: {e}")
+
+# ---------------- 4. DATA REGISTRY ----------------
 # Hardcoded demo registry: ICAO24 / registration -> aircraft type
 AIRCRAFT_REGISTRY = {
     "800736": "Boeing 737-800",
@@ -17,31 +67,6 @@ AIRCRAFT_REGISTRY = {
     "ABC123": "Airbus A320",
 }
 
-# ---------------- APP ----------------
-app = FastAPI(
-    title="Aircraft Health & Efficiency API",
-    description="ADS-B anomaly + CMAPSS engine health services",
-    version="1.0.0",
-)
-
-# ---------------- LOAD MODELS ----------------
-# ADS-B models
-try:
-    if_model = joblib.load(IF_MODEL_PATH)
-    scaler = joblib.load(SCALER_PATH)
-    print("✅ Isolation Forest and scaler loaded.")
-except Exception as e:
-    print(f"❌ Error loading ADS-B model or scaler: {e}")
-    if_model = None
-    scaler = None
-
-# CMAPSS model
-try:
-    cmapss_model = joblib.load(CMAPSS_MODEL_PATH)
-    print("✅ CMAPSS health model loaded.")
-except Exception as e:
-    print(f"❌ Error loading CMAPSS model: {e}")
-    cmapss_model = None
 
 # ---------------- Pydantic SCHEMAS ----------------
 class ADSBIFInput(BaseModel):
@@ -441,4 +466,51 @@ def analyze_route(req: AnalysisRequest):
         "aircraft_age_years": aircraft_age_years,
         "last_maintenance_days": last_maintenance_days,
         "last_maintenance_type": last_maintenance_type,
+    }
+# ---------------------------------------------------------
+# FYP-2 DATABASE ENDPOINTS
+# ---------------------------------------------------------
+
+@app.get("/api/fleet")
+def get_fleet_data(db: Session = Depends(get_db)):
+    """
+    Fetches all aircraft currently registered in the live database.
+    """
+    # This single line of Python replaces a massive SQL "SELECT * FROM fleet" query!
+    aircraft_list = db.query(models_db.Fleet).all()
+    
+    if not aircraft_list:
+        return {"message": "Database connected, but the Fleet table is empty. Waiting for Ruhab to add seed data!"}
+    
+    return {"aircraft": aircraft_list}
+
+# ... (Keep all your existing code above) ...
+
+@app.get("/api/telemetry/{tail_number}")
+def get_latest_telemetry(tail_number: str, db: Session = Depends(get_db)):
+    """
+    FYP-2: Fetches the most recent live coordinates for a specific aircraft.
+    Areeba will use this to plot the plane on the Streamlit map.
+    """
+    # Query the FlightTelemetry table, filter by the tail number, 
+    # sort by the newest timestamp first, and grab the top result.
+    latest_flight = db.query(models_db.FlightTelemetry)\
+                      .filter(models_db.FlightTelemetry.callsign == tail_number)\
+                      .order_by(models_db.FlightTelemetry.timestamp.desc())\
+                      .first()
+    
+    if not latest_flight:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"No telemetry data found for aircraft {tail_number}. Is OpenSky running?"
+        )
+    
+    return {
+        "tail_number": latest_flight.callsign,
+        "altitude": latest_flight.altitude,
+        "velocity": latest_flight.velocity,
+        "latitude": latest_flight.latitude,
+        "longitude": latest_flight.longitude,
+        "timestamp": latest_flight.timestamp,
+        "anomaly_flag": latest_flight.anomaly_flag
     }

@@ -11,7 +11,7 @@ st.set_page_config(page_title="AI-Powered Aircraft Dashboard", layout="wide")
 st.markdown("""
 <style>
     .stApp { background-color: #0a0e1a; }
-    .main-header {
+    .main-header {bng mjk,lo0p
         background: linear-gradient(135deg, #1e3a5f 0%, #2d5a7b 100%);
         padding: 15px;
         border-radius: 8px;
@@ -89,7 +89,8 @@ with col4:
 
 with col5:
     st.markdown("<br>", unsafe_allow_html=True)
-    run_clicked = st.button("Run Analysis", use_container_width=True)
+    # FIX 1: Removed use_container_width=True to stop warning
+    run_clicked = st.button("Run Analysis") 
 
 # ---- Additional aircraft & maintenance context (FYP-1) ----
 ctx_col1, ctx_col2, ctx_col3, ctx_col4, ctx_col5 = st.columns([2, 1.2, 1.2, 1.2, 1.5])
@@ -169,7 +170,8 @@ if st.session_state.analysis_data:
             margin=dict(l=20, r=20, t=30, b=10),
         )
 
-        st.plotly_chart(fig, use_container_width=True)
+        # FIX 2: Removed use_container_width=True to stop warning
+        st.plotly_chart(fig)
 
         # Aircraft ID / type + context
         if data.get("aircraft_id"):
