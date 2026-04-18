@@ -62,3 +62,19 @@ class HealthPrediction(Base):
 
     # Relationship back to Fleet
     aircraft = relationship("Fleet", back_populates="health_logs")
+    # ==========================================
+# FYP-2: FLIGHT HISTORY TABLE
+# ==========================================
+class FlightHistory(Base):
+    __tablename__ = "flight_history"
+
+    flight_id = Column(Integer, primary_key=True, index=True)
+    tail_number = Column(String, index=True) 
+    origin = Column(String)
+    destination = Column(String)
+    total_fuel_liters = Column(Float)
+    co2_kg = Column(Float)
+    final_health_score = Column(Float)
+    
+    # Automatically logs the exact time the flight was completed
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())

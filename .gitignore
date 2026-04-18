@@ -1,0 +1,52 @@
+# ── Virtual Environments ──
+venv/
+venv311/
+*.env
+
+# ── Python Cache ──
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── ML Models (large binary files) ──
+*.keras
+*.pkl
+*.npy
+*.h5
+
+# ── Database ──
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Jupyter Notebooks Checkpoints ──
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Logs & Exports ──
+*.log
+*.png
+*.csv
+*.txt
+training_curves.png
+DAY*.png
+DAY*.md
+
+# ── API Config (contains MAE scores, paths) ──
+api_config.json
+
+# ── OS Files ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ──
+.vscode/
+.idea/
+
+# ── Build ──
+dist/
+build/
+*.egg-info/
