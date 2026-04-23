@@ -55,16 +55,39 @@ def fetch_analysis(tail_number):
     return None
 
 # ================== SIDEBAR ==================
+# ================== SIDEBAR ==================
 st.sidebar.title("✈️ Fleet Control")
-FLEET_LIST = fetch_fleet()
 
-if "Backend Offline" in FLEET_LIST:
-    st.sidebar.error("⚠️ FastAPI Backend is offline. Please run `uvicorn main:app --reload`.")
+# 1. Fetch the new complex dictionary list from the backend
+fleet_data = fetch_fleet() # Make sure this matches your fetch_fleet function name
+
+if "Backend Offline" in fleet_data:
+    st.sidebar.error("⚠️ FastAPI Backend is offline.")
     st.stop()
 
-selected_plane = st.sidebar.selectbox("Select Aircraft", FLEET_LIST)
+# 2. Map the data for the UI Dropdown
+display_options = {}
+for plane in fleet_data:
+    # If the API sent a dictionary (The New Way)
+    if isinstance(plane, dict):
+        tail = plane.get("tail_number", "Unknown")
+        flight = plane.get("current_flight", "Grounded")
+        ui_label = f"✈️ {tail} (Flight: {flight})"
+        display_options[ui_label] = tail
+    # If the API sent a string (Fallback for old cache)
+    else:
+        display_options[f"✈️ {plane}"] = plane
+
+# 3. Render the Dropdown
+selected_label = st.sidebar.selectbox("Select Aircraft", list(display_options.keys()))
+
+# 4. Extract JUST the tail number to pass to the ML backend
+selected_plane = display_options[selected_label]
+
 page = st.sidebar.radio("Navigation", ["Live Dashboard", "Mission Logs"])
 
+# Fetch Data for the selected physical plane
+API_DATA = fetch_analysis(selected_plane)
 # Fetch Data for selected plane
 API_DATA = fetch_analysis(selected_plane)
 

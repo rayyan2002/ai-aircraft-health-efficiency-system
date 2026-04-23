@@ -173,17 +173,43 @@ def analyze_route_old(req: AnalysisRequest):
 
 @app.get("/api/fleet")
 def get_fleet_data(db: Session = Depends(get_db)):
-    """Fetches unique aircraft from telemetry since fleet table might be empty."""
+    """Fetches aircraft tail numbers and their active flight callsign."""
     try:
-        # Using SQLAlchemy to get distinct callsigns
+        # 1. Try to pull the actual physical assets from the Fleet table
+        fleet_planes = db.query(models_db.Fleet).all()
+        response_data = []
+        
+        if fleet_planes:
+            for plane in fleet_planes:
+                # Find what this specific plane is currently flying as
+                latest = db.query(models_db.FlightTelemetry)\
+                    .filter(models_db.FlightTelemetry.tail_number == plane.tail_number)\
+                    .order_by(models_db.FlightTelemetry.timestamp.desc()).first()
+                
+                flight_no = latest.callsign if latest and latest.callsign else "Grounded"
+                response_data.append({
+                    "tail_number": plane.tail_number,
+                    "current_flight": flight_no
+                })
+            return {"fleet": response_data}
+        
+        # --- FALLBACK (If Ruhab hasn't populated the fleet table yet) ---
+        # We grab the live OpenSky callsigns and dynamically generate a fake Tail Number
         callsigns = db.query(models_db.FlightTelemetry.callsign).distinct().all()
         planes = [c[0] for c in callsigns if c[0] is not None]
+        
         if not planes:
-            return {"fleet": ["AIC1713 (Fallback)"]}
-        return {"fleet": planes}
+            return {"fleet": [{"tail_number": "AP-BLC", "current_flight": "PK304"}]}
+            
+        # Creating mock tail numbers (e.g., "AIRCRAFT-713") paired with the real flight number
+        for p in planes:
+            mock_tail = f"AIRCRAFT-{p[-3:]}" if len(p) >= 3 else "AIRCRAFT-X"
+            response_data.append({"tail_number": mock_tail, "current_flight": p})
+            
+        return {"fleet": response_data}
+        
     except Exception as e:
-        return {"fleet": ["Database Error"]}
-
+        return {"fleet": [{"tail_number": "Error", "current_flight": str(e)}]}
 @app.get("/api/telemetry/{tail_number}")
 def get_latest_telemetry(tail_number: str, db: Session = Depends(get_db)):
     latest_flight = db.query(models_db.FlightTelemetry)\

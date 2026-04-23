@@ -38,6 +38,7 @@ class FlightTelemetry(Base):
 
     # Note: We mapped 'callsign' to 'tail_number' for the live API context
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    tail_number = Column(String, index=True)
     callsign = Column(String, ForeignKey("fleet.tail_number"), index=True) 
     altitude = Column(Float)
     velocity = Column(Float)
