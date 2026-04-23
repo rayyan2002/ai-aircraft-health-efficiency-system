@@ -21,9 +21,9 @@ def fetch_live_flights_pakistan():
 
     # Bounding Box for the pakistan
     params = {
-        "lamin": 20.0, "lomin": 55.0,
-        "lamax": 40.0, "lomax": 80.0
-    }
+    "lamin": 23.5, "lomin": 60.5,
+    "lamax": 37.5, "lomax": 77.5,
+}
 
     print("📡 Pinging OpenSky Network API for Pakistani Airspace...")
     
