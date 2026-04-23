@@ -35,10 +35,11 @@ from datetime import datetime as _datetime
 
 DB_PATH = os.path.join(BASE_DIR, "..", "backend", "aviation_data.db")
 
-# Pakistan + surrounding airspace bounding box
+# Pakistan-only airspace bounding box
+# Lat: 23°N to 37.5°N | Lon: 61°E to 78°E
 OPENSKY_PARAMS = {
-    "lamin": 20.0, "lomin": 55.0,
-    "lamax": 40.0, "lomax": 80.0,
+    "lamin": 23.0, "lomin": 61.0,
+    "lamax": 37.5, "lomax": 78.0,
 }
 
 def fetch_and_insert_opensky():
@@ -66,10 +67,21 @@ def fetch_and_insert_opensky():
             print("⚠️ [OpenSky] No flights in bounding box right now.")
             return
 
-        conn    = _sqlite3.connect(DB_PATH)
-        cursor  = conn.cursor()
-        saved   = 0
-        limit   = 100   # max rows per cycle
+        conn   = _sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        # ── THE LOCK: load whitelist from fleet table ──
+        fleet_rows   = cursor.execute("SELECT tail_number FROM fleet").fetchall()
+        whitelisted  = {r[0].strip().upper() for r in fleet_rows}
+        use_whitelist = len(whitelisted) > 0
+
+        if use_whitelist:
+            print(f"🔒 [OpenSky] Fleet lock active — {len(whitelisted)} whitelisted tails")
+        else:
+            print("⚠️ [OpenSky] Fleet table empty — saving all Pakistan flights (pre-seed mode)")
+
+        saved = 0
+        limit = 100
 
         for flight in states:
             if saved >= limit:
@@ -82,18 +94,21 @@ def fetch_and_insert_opensky():
             alt      = flight[7]
             vel      = flight[9]
 
-            # Skip ground / incomplete records
             if None in (lat, lon, alt, vel):
                 continue
             if alt <= 0:
+                continue
+
+            # ── WHITELIST CHECK: skip planes not in fleet table ──
+            if use_whitelist and icao24 not in whitelisted:
                 continue
 
             cursor.execute("""
                 INSERT INTO flight_telemetry
                 (tail_number, callsign, altitude, velocity,
                  latitude, longitude, anomaly_flag, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (icao24, callsign, alt, vel, lat, lon, 0, _datetime.now()))
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+            """, (icao24, callsign, alt, vel, lat, lon, _datetime.now()))
             saved += 1
 
         conn.commit()
@@ -112,10 +127,14 @@ async def automated_data_pipeline():
         print("🔄 [HEARTBEAT] Running Automated Data Pipeline...")
         db = SessionLocal()
         try:
-            # --- 1. FETCH LIVE OPENSKY DATA ---
-            await asyncio.get_event_loop().run_in_executor(None, fetch_and_insert_opensky)
+            # ── Fetch live OpenSky data ──
+            # Whitelist is enforced inside fetch_and_insert_opensky
+            # by querying the fleet table directly
+            await asyncio.get_event_loop().run_in_executor(
+                None, fetch_and_insert_opensky
+            )
 
-            # --- 2. THE AUTO-LANDER: POPULATE FLIGHT HISTORY ---
+            # ── Auto-lander: detect landed planes and log to history ──
             flying_planes = db.query(models_db.FlightTelemetry.callsign).distinct().all()
 
             for plane in flying_planes:
@@ -476,7 +495,7 @@ def analyze_aircraft_live(tail_number: str, db: Session = Depends(get_db)):
     # Safe defaults — only used if DB has zero rows for this plane
     predicted_rul             = 45.2
     lat, lon                  = 30.3753, 69.3451   # centre of Pakistan
-    alt, speed                = 8000.0, 200.0
+    alt, speed                = 9000.0, 220.0      # typical cruise defaults
     n_records                 = 1
     vertical_rate, true_track = -5.0, 145.0
     anomaly_flag, if_score    = 0, -0.05
