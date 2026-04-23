@@ -107,9 +107,9 @@ if page == "Live Dashboard":
         risk_color = "red" if API_DATA['risk_level'] == "High" else "green"
         st.markdown(f'<div class="metric-card"><h3>Health Risk</h3><h2 style="color:{risk_color};">{API_DATA["risk_level"]}</h2></div>', unsafe_allow_html=True)
     with col3:
-        st.markdown(f'<div class="metric-card"><h3>Altitude</h3><h2>{API_DATA["live_telemetry"]["alt_ft"]} ft</h2></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><h3>Altitude</h3><h2>{API_DATA["live_telemetry"]["alt_m"]} m</h2></div>', unsafe_allow_html=True)
     with col4:
-        st.markdown(f'<div class="metric-card"><h3>Airspeed</h3><h2>{API_DATA["live_telemetry"]["speed_knots"]} kts</h2></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><h3>Airspeed</h3><h2>{API_DATA["live_telemetry"]["speed_ms"]} m/s</h2></div>', unsafe_allow_html=True)
 
     st.write("---")
 
@@ -120,17 +120,63 @@ if page == "Live Dashboard":
         st.subheader("📍 Live Telemetry")
         lat = API_DATA['live_telemetry']['lat']
         lon = API_DATA['live_telemetry']['lon']
-        
-        # Create Folium Map
+
+        # Fetch full flight path from the new route endpoint
+        try:
+            route_resp = requests.get(f"{API_BASE_URL}/route/{selected_plane}", timeout=5)
+            route_data = route_resp.json() if route_resp.status_code == 200 else None
+        except:
+            route_data = None
+
+        # Build the map
         m = folium.Map(location=[lat, lon], zoom_start=6, tiles="CartoDB dark_matter")
+
+        if route_data and len(route_data.get("route_points", [])) > 1:
+            points = route_data["route_points"]
+            coords = [[p["lat"], p["lon"]] for p in points]
+
+            # ── Dashed trail line (past path) ──
+            folium.PolyLine(
+                coords,
+                color="#00aaff",
+                weight=2,
+                opacity=0.7,
+                dash_array="6 4",
+                tooltip="Flight Path"
+            ).add_to(m)
+
+            # ── Origin marker ──
+            origin = points[0]
+            folium.CircleMarker(
+                location=[origin["lat"], origin["lon"]],
+                radius=6,
+                color="#ffffff",
+                fill=True,
+                fill_color="#ffffff",
+                fill_opacity=0.9,
+                tooltip="Origin"
+            ).add_to(m)
+
+            # ── Waypoint dots along the route ──
+            step = max(1, len(coords) // 8)
+            for pt in coords[1:-1:step]:
+                folium.CircleMarker(
+                    location=pt,
+                    radius=3,
+                    color="#0077cc",
+                    fill=True,
+                    fill_color="#0077cc",
+                    fill_opacity=0.6,
+                ).add_to(m)
+
+        # ── Current position — plane icon ──
         folium.Marker(
-            [lat, lon], 
-            tooltip=f"{selected_plane} | {API_DATA['live_telemetry']['speed_knots']} kts", 
-            icon=folium.Icon(color="red", icon="plane")
+            [lat, lon],
+            tooltip=f"✈ {selected_plane} | {API_DATA['live_telemetry']['speed_ms']} m/s | {API_DATA['live_telemetry']['alt_m']} m",
+            icon=folium.Icon(color="red", icon="plane", prefix="fa")
         ).add_to(m)
-        
-        # Render in Streamlit
-        st_folium(m, width=600, height=400, returned_objects=[])
+
+        st_folium(m, width=600, height=420, returned_objects=[])
 
     with chart_col:
         st.subheader("🧠 ML Diagnostics (SHAP)")

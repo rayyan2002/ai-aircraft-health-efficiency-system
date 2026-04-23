@@ -13,19 +13,19 @@ SRC_DIR = os.path.dirname(SCRIPT_DIR)
 DB_PATH = os.path.join(SRC_DIR, "backend", "aviation_data.db")
 
 print(f"🔗 Connecting to database at: {DB_PATH}")
-def fetch_live_flights_asia():
+def fetch_live_flights_pakistan():
     """
-    Fetches live flight data for Asia and saves it to the SQLite database.
+    Fetches live flight data for Pakistan and saves it to the SQLite database.
     """
     url = "https://opensky-network.org/api/states/all"
 
-    # Bounding Box for the Asian Continent
+    # Bounding Box for the pakistan
     params = {
-        "lamin": -10.0, "lomin": 40.0, 
-        "lamax": 55.0, "lomax": 150.0
+        "lamin": 20.0, "lomin": 55.0,
+        "lamax": 40.0, "lomax": 80.0
     }
-    
-    print("📡 Pinging OpenSky Network API for Asian Airspace...")
+
+    print("📡 Pinging OpenSky Network API for Pakistani Airspace...")
     
     try:
         response = requests.get(url, params=params, timeout=15)
@@ -91,4 +91,4 @@ def fetch_live_flights_asia():
         print(f"❌ Database Error: {sql_e}")
 
 if __name__ == "__main__":
-    fetch_live_flights_asia()
+    fetch_live_flights_pakistan()
