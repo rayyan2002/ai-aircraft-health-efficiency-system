@@ -1,5 +1,5 @@
 # ✈️ AI-Powered Aircraft Health & Efficiency System
-### Live Digital Twin — FYP-2 | GIKI AI Bootcamp 2025
+### Live Digital Twin — FYP-2 
 
 > *Predicting engine failure before it happens — by analyzing how a plane is flying right now.*
 
@@ -347,4 +347,3 @@ The background worker fetches every 5 minutes. OpenSky free tier allows ~400 req
 
 ---
 
-*Built at GIKI AI Bootcamp 2025 — Sprint 3 of 4*
