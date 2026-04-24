@@ -1,0 +1,37 @@
+# ============================================================
+# Aircraft Digital Twin — Requirements
+# Python 3.11 | Windows
+# ============================================================
+# Install: pip install -r requirements.txt --only-binary=:all:
+
+# ── Core API ──────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+
+# ── Database ──────────────────────────────────────────────
+sqlalchemy==2.0.30
+
+# ── ML Stack ──────────────────────────────────────────────
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.4.2
+joblib==1.4.2
+tensorflow==2.17.0
+keras==3.4.1
+
+# ── Data ──────────────────────────────────────────────────
+pandas==2.2.2
+
+# ── Frontend ──────────────────────────────────────────────
+streamlit==1.35.0
+plotly==5.22.0
+folium==0.16.0
+streamlit-folium==0.20.0
+
+# ── HTTP ──────────────────────────────────────────────────
+requests==2.32.2
+
+# ── Utilities ─────────────────────────────────────────────
+matplotlib==3.9.0
+python-multipart==0.0.9

@@ -29,7 +29,7 @@ __pycache__/
 *.log
 *.png
 *.csv
-*.txt
+txt
 training_curves.png
 DAY*.png
 DAY*.md
