@@ -3,240 +3,735 @@ import requests
 import folium
 from streamlit_folium import st_folium
 import plotly.graph_objects as go
+import plotly.express as px
 import pandas as pd
 
-# ================== CONFIG & CSS ==================
-API_BASE_URL = "http://localhost:8000/api"
+# ══════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════
+API = "http://localhost:8000/api"
 
-st.set_page_config(page_title="Aircraft Digital Twin Dashboard", layout="wide", page_icon="✈️")
+st.set_page_config(
+    page_title="AeroTwin — Pakistan Digital Fleet",
+    layout="wide",
+    page_icon="🛫",
+    initial_sidebar_state="expanded",
+)
 
+# ══════════════════════════════════════════════════════════════
+# DESIGN SYSTEM
+# ══════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-    .stApp { background-color: #0a0e1a; }
-    .main-header {
-        background: linear-gradient(135deg, #1e3a5f 0%, #2d5a7b 100%);
-        padding: 15px;
-        border-radius: 8px;
-        text-align: center;
-        color: white;
-        font-size: 24px;
-        font-weight: bold;
-        margin-bottom: 20px;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #1a2332 0%, #2a3447 100%);
-        padding: 20px;
-        border-radius: 10px;
-        border: 1px solid #2d4263;
-        color: white;
-        text-align: center;
-    }
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Inter:wght@300;400;500;600&display=swap');
+
+/* ── Root ── */
+:root {
+    --bg-deep:    #060810;
+    --bg-card:    #0d1117;
+    --bg-hover:   #161b22;
+    --border:     #21262d;
+    --border-glow:#1f6feb;
+    --accent:     #1f6feb;
+    --accent-2:   #388bfd;
+    --green:      #3fb950;
+    --yellow:     #d29922;
+    --red:        #f85149;
+    --text-prime: #e6edf3;
+    --text-muted: #7d8590;
+    --text-dim:   #484f58;
+}
+
+/* ── Global ── */
+.stApp { background-color: var(--bg-deep) !important; }
+* { font-family: 'Inter', sans-serif; }
+section[data-testid="stSidebar"] {
+    background: #0d1117 !important;
+    border-right: 1px solid var(--border) !important;
+}
+section[data-testid="stSidebar"] * { color: var(--text-prime) !important; }
+
+/* ── Hide Streamlit chrome ── */
+#MainMenu, footer, header { visibility: hidden; }
+
+/* ── Header ── */
+.aero-header {
+    font-family: 'Orbitron', monospace;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+}
+.aero-title {
+    font-family: 'Orbitron', monospace;
+    font-size: 26px;
+    font-weight: 900;
+    color: var(--text-prime);
+    letter-spacing: 2px;
+    line-height: 1.2;
+}
+.aero-title span { color: var(--accent-2); }
+
+/* ── KPI Cards ── */
+.kpi-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px 20px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.2s;
+}
+.kpi-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+}
+.kpi-card:hover { border-color: var(--border-glow); }
+.kpi-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+}
+.kpi-value {
+    font-family: 'Orbitron', monospace;
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--text-prime);
+    line-height: 1;
+}
+.kpi-unit {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+.kpi-green .kpi-value  { color: var(--green); }
+.kpi-yellow .kpi-value { color: var(--yellow); }
+.kpi-red .kpi-value    { color: var(--red); }
+.kpi-blue .kpi-value   { color: var(--accent-2); }
+
+/* ── Section headers ── */
+.section-title {
+    font-family: 'Orbitron', monospace;
+    font-size: 11px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+    margin-bottom: 16px;
+}
+
+/* ── Status badges ── */
+.badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+.badge-airborne { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+.badge-grounded { background: rgba(125,133,144,0.15); color: var(--text-muted); border: 1px solid rgba(125,133,144,0.3); }
+.badge-high     { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
+.badge-moderate { background: rgba(210,153,34,0.15); color: var(--yellow); border: 1px solid rgba(210,153,34,0.3); }
+.badge-low      { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+
+/* ── Fleet aircraft cards ── */
+.ac-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.ac-card:hover { border-color: var(--accent); background: var(--bg-hover); }
+.ac-card-tail {
+    font-family: 'Orbitron', monospace;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--accent-2);
+}
+.ac-card-type {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+
+/* ── Info rows ── */
+.info-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+}
+.info-label { color: var(--text-muted); }
+.info-value { color: var(--text-prime); font-weight: 500; }
+
+/* ── Divider ── */
+.divider {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 20px 0;
+}
+
+/* ── Sidebar brand ── */
+.sidebar-brand {
+    font-family: 'Orbitron', monospace;
+    font-size: 16px;
+    font-weight: 900;
+    color: var(--accent-2) !important;
+    letter-spacing: 2px;
+    padding: 8px 0 16px 0;
+}
+.sidebar-section {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--text-dim) !important;
+    padding: 12px 0 6px 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# ================== API CONNECTION ==================
-@st.cache_data(ttl=10) # Caches for 10 seconds to avoid spamming the backend
+
+# ══════════════════════════════════════════════════════════════
+# API HELPERS
+# ══════════════════════════════════════════════════════════════
+@st.cache_data(ttl=15)
 def fetch_fleet():
+    """Live Dashboard — always queries flight_telemetry callsigns directly."""
     try:
-        response = requests.get(f"{API_BASE_URL}/fleet")
-        if response.status_code == 200:
-            return response.json().get("fleet", ["No API Connection"])
+        r = requests.get(f"{API}/live_fleet", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("fleet", [])
     except:
         pass
-    return ["Backend Offline"]
+    return []
 
-def fetch_analysis(tail_number):
+@st.cache_data(ttl=15)
+def fetch_pak_fleet():
     try:
-        response = requests.get(f"{API_BASE_URL}/analyze/{tail_number}")
-        if response.status_code == 200:
-            return response.json()
+        r = requests.get(f"{API}/pak_fleet", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("fleet", [])
+    except:
+        pass
+    return []
+
+def fetch_analysis(tail):
+    try:
+        r = requests.get(f"{API}/analyze/{tail}", timeout=10)
+        if r.status_code == 200:
+            return r.json()
     except:
         pass
     return None
 
-# ================== SIDEBAR ==================
-# ================== SIDEBAR ==================
-st.sidebar.title("✈️ Fleet Control")
+def fetch_pak_analysis(tail):
+    try:
+        r = requests.get(f"{API}/pak_analyze/{tail}", timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except:
+        pass
+    return None
 
-# 1. Fetch the new complex dictionary list from the backend
-fleet_data = fetch_fleet() # Make sure this matches your fetch_fleet function name
+def fetch_route(tail, pak=False):
+    endpoint = "pak_route" if pak else "route"
+    try:
+        r = requests.get(f"{API}/{endpoint}/{tail}", timeout=5)
+        if r.status_code == 200:
+            return r.json()
+    except:
+        pass
+    return None
 
-if "Backend Offline" in fleet_data:
-    st.sidebar.error("⚠️ FastAPI Backend is offline.")
-    st.stop()
+def fetch_history(tail, pak=False):
+    endpoint = "pak_history" if pak else "history"
+    try:
+        r = requests.get(f"{API}/{endpoint}/{tail}", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("history", [])
+    except:
+        pass
+    return []
 
-# 2. Map the data for the UI Dropdown
-display_options = {}
-for plane in fleet_data:
-    # If the API sent a dictionary (The New Way)
-    if isinstance(plane, dict):
-        tail = plane.get("tail_number", "Unknown")
-        flight = plane.get("current_flight", "Grounded")
-        ui_label = f"✈️ {tail} (Flight: {flight})"
-        display_options[ui_label] = tail
-    # If the API sent a string (Fallback for old cache)
-    else:
-        display_options[f"✈️ {plane}"] = plane
 
-# 3. Render the Dropdown
-selected_label = st.sidebar.selectbox("Select Aircraft", list(display_options.keys()))
+# ══════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════
+st.sidebar.markdown('<div class="sidebar-brand">AEROTWIN</div>', unsafe_allow_html=True)
+st.sidebar.markdown('<div class="sidebar-section">Navigation</div>', unsafe_allow_html=True)
 
-# 4. Extract JUST the tail number to pass to the ML backend
-selected_plane = display_options[selected_label]
+page = st.sidebar.radio(
+    "",
+    ["📡  Live Dashboard", "🇵🇰  Pakistan Fleet", "📋  Mission Logs"],
+    label_visibility="collapsed"
+)
 
-page = st.sidebar.radio("Navigation", ["Live Dashboard", "Mission Logs"])
+st.sidebar.markdown('<div class="sidebar-section">Aircraft Selection</div>', unsafe_allow_html=True)
 
-# Fetch Data for the selected physical plane
-API_DATA = fetch_analysis(selected_plane)
-# Fetch Data for selected plane
-API_DATA = fetch_analysis(selected_plane)
+# ── Aircraft selection depends on page ──
+if page == "🇵🇰  Pakistan Fleet":
+    pak_fleet = fetch_pak_fleet()
 
-if not API_DATA:
-    st.error(f"Failed to fetch ML analysis for {selected_plane}.")
-    st.stop()
+    # Group by airline
+    airlines = sorted(set(p.get("airline", "Unknown") for p in pak_fleet))
+    airline_icons = {
+        "Pakistan International Airlines": "🟢 PIA",
+        "AirBlue":   "🔵 AirBlue",
+        "AirSial":   "🟠 AirSial",
+        "Fly Jinnah":"🔴 FlyJinnah",
+    }
 
-# ================== PAGE 1: LIVE DASHBOARD ==================
-if page == "Live Dashboard":
-    st.markdown(f'<div class="main-header">Live Digital Twin: {selected_plane}</div>', unsafe_allow_html=True)
-    
-    # --- Top Metrics ---
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.markdown(f'<div class="metric-card"><h3>Predicted RUL</h3><h2>{API_DATA["predicted_rul_cycles"]} cycles</h2></div>', unsafe_allow_html=True)
-    with col2:
-        risk_color = "red" if API_DATA['risk_level'] == "High" else "green"
-        st.markdown(f'<div class="metric-card"><h3>Health Risk</h3><h2 style="color:{risk_color};">{API_DATA["risk_level"]}</h2></div>', unsafe_allow_html=True)
-    with col3:
-        st.markdown(f'<div class="metric-card"><h3>Altitude</h3><h2>{API_DATA["live_telemetry"]["alt_m"]} m</h2></div>', unsafe_allow_html=True)
-    with col4:
-        st.markdown(f'<div class="metric-card"><h3>Airspeed</h3><h2>{API_DATA["live_telemetry"]["speed_ms"]} m/s</h2></div>', unsafe_allow_html=True)
+    selected_airline = st.sidebar.selectbox(
+        "Airline",
+        airlines,
+        format_func=lambda x: airline_icons.get(x, x)
+    )
 
-    st.write("---")
+    airline_planes = [p for p in pak_fleet if p.get("airline") == selected_airline]
+    plane_options  = {
+        f"{'✈' if p.get('status')=='airborne' else '🅿'} {p['tail_number']} — {p.get('aircraft_type','').split('-')[0]}": p["tail_number"]
+        for p in airline_planes
+    }
 
-    # --- Map & SHAP Charts ---
-    map_col, chart_col = st.columns([1, 1])
+    if not plane_options:
+        st.sidebar.warning("No aircraft found for this airline.")
+        st.stop()
 
-    with map_col:
-        st.subheader("📍 Live Telemetry")
-        lat = API_DATA['live_telemetry']['lat']
-        lon = API_DATA['live_telemetry']['lon']
+    selected_label = st.sidebar.selectbox("Aircraft", list(plane_options.keys()))
+    selected_plane = plane_options[selected_label]
+    selected_pak_data = next((p for p in pak_fleet if p["tail_number"] == selected_plane), {})
 
-        # Fetch full flight path from the new route endpoint
-        try:
-            route_resp = requests.get(f"{API_BASE_URL}/route/{selected_plane}", timeout=5)
-            route_data = route_resp.json() if route_resp.status_code == 200 else None
-        except:
-            route_data = None
+else:
+    # Live Dashboard / Mission Logs use flight_telemetry callsigns
+    fleet_data = fetch_fleet()
+    if not fleet_data:
+        st.sidebar.error("⚠️ Backend offline.")
+        st.stop()
 
-        # Build the map
-        m = folium.Map(location=[lat, lon], zoom_start=6, tiles="CartoDB dark_matter")
+    display_options = {}
+    for plane in fleet_data:
+        if isinstance(plane, dict):
+            tail   = plane.get("tail_number", "Unknown")
+            flight = plane.get("current_flight", "—")
+            display_options[f"✈️  {tail}  ·  {flight}"] = tail
+        else:
+            display_options[f"✈️  {plane}"] = plane
 
-        if route_data and len(route_data.get("route_points", [])) > 1:
-            points = route_data["route_points"]
-            coords = [[p["lat"], p["lon"]] for p in points]
+    selected_label = st.sidebar.selectbox("Callsign", list(display_options.keys()))
+    selected_plane = display_options[selected_label]
 
-            # ── Dashed trail line (past path) ──
-            folium.PolyLine(
-                coords,
-                color="#00aaff",
-                weight=2,
-                opacity=0.7,
-                dash_array="6 4",
-                tooltip="Flight Path"
-            ).add_to(m)
+st.sidebar.markdown("---")
+st.sidebar.caption(f"AeroTwin v2.0  ·  Sprint 3")
 
-            # ── Origin marker ──
-            origin = points[0]
-            folium.CircleMarker(
-                location=[origin["lat"], origin["lon"]],
-                radius=6,
-                color="#ffffff",
-                fill=True,
-                fill_color="#ffffff",
-                fill_opacity=0.9,
-                tooltip="Origin"
-            ).add_to(m)
 
-            # ── Waypoint dots along the route ──
-            step = max(1, len(coords) // 8)
-            for pt in coords[1:-1:step]:
-                folium.CircleMarker(
-                    location=pt,
-                    radius=3,
-                    color="#0077cc",
-                    fill=True,
-                    fill_color="#0077cc",
-                    fill_opacity=0.6,
-                ).add_to(m)
+# ══════════════════════════════════════════════════════════════
+# SHARED: MAP BUILDER
+# ══════════════════════════════════════════════════════════════
+def build_map(lat, lon, tail, speed, alt, route_data=None, callsign=None):
 
-        # ── Current position — plane icon ──
-        folium.Marker(
-            [lat, lon],
-            tooltip=f"✈ {selected_plane} | {API_DATA['live_telemetry']['speed_ms']} m/s | {API_DATA['live_telemetry']['alt_m']} m",
-            icon=folium.Icon(color="red", icon="plane", prefix="fa")
+    # ── Convert ICAO callsign → public IATA flight number ──
+    ICAO_TO_IATA = {
+        "PIA": "PK", "ABQ": "PA", "FJL": "9P",
+        "SIF": "PF", "ERD": "PF", "SAI": "ER",
+    }
+    def to_iata_flight(cs):
+        if not cs:
+            return cs
+        cs = cs.strip().upper()
+        for icao_prefix, iata_prefix in ICAO_TO_IATA.items():
+            if cs.startswith(icao_prefix):
+                number = cs[len(icao_prefix):]
+                return f"{iata_prefix}{number}"
+        return cs   # unknown airline — return as-is
+
+    display_callsign = to_iata_flight(callsign or tail)
+    label = display_callsign
+
+    m = folium.Map(
+        location=[lat, lon],
+        zoom_start=6,
+        tiles="CartoDB dark_matter"
+    )
+
+    if route_data and len(route_data.get("route_points", [])) > 1:
+        points = route_data["route_points"]
+        coords = [[p["lat"], p["lon"]] for p in points]
+
+        folium.PolyLine(
+            coords, color="#1f6feb", weight=2,
+            opacity=0.8, dash_array="6 4",
+            tooltip=f"{label} — flight path"
         ).add_to(m)
 
-        st_folium(m, width=600, height=420, returned_objects=[])
+        # ── Origin marker ──
+        folium.CircleMarker(
+            location=coords[0], radius=5,
+            color="#7d8590", fill=True,
+            fill_color="#7d8590", fill_opacity=0.9,
+            tooltip=f"Origin"
+        ).add_to(m)
 
-    with chart_col:
-        st.subheader("🧠 ML Diagnostics (SHAP)")
-        shap_data = API_DATA['explainability_shap']
-        
-        # Create Plotly Waterfall Chart
-        fig = go.Figure(go.Waterfall(
-            orientation="h",
-            measure=["relative"] * len(shap_data),
-            y=[item['feature'] for item in shap_data],
-            x=[item['impact'] for item in shap_data],
-            connector={"line": {"color": "rgb(63, 63, 63)"}},
-            decreasing={"marker": {"color": "#ff4b4b"}},
-            increasing={"marker": {"color": "#00cc96"}}
-        ))
-        
-        fig.update_layout(
-            height=400, 
-            margin=dict(l=20, r=20, t=20, b=20),
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            font=dict(color='white')
+        # ── Waypoint callsign labels every few points ──
+        step = max(1, len(coords) // 4)
+        for pt in coords[1:-1:step]:
+            folium.Marker(
+                location=pt,
+                icon=folium.DivIcon(
+                    html=f'<div style="font-family:monospace;font-size:9px;'
+                         f'color:#388bfd;background:rgba(13,17,23,0.75);'
+                         f'padding:1px 4px;border-radius:3px;white-space:nowrap;'
+                         f'border:1px solid #1f6feb">{label}</div>',
+                    icon_size=(60, 16),
+                    icon_anchor=(30, 8),
+                ),
+                tooltip=f"{label}"
+            ).add_to(m)
+
+    # ── Current position — plane icon with callsign popup ──
+    folium.Marker(
+        [lat, lon],
+        tooltip=f"✈ {label} | {speed} m/s | {alt} m",
+        popup=folium.Popup(
+            f"<b style='font-family:monospace'>{label}</b><br>"
+            f"Reg: {tail}<br>"
+            f"Alt: {alt} m<br>"
+            f"Speed: {speed} m/s",
+            max_width=160
+        ),
+        icon=folium.Icon(color="red", icon="plane", prefix="fa")
+    ).add_to(m)
+
+    return m
+
+
+# ══════════════════════════════════════════════════════════════
+# SHARED: SHAP CHART
+# ══════════════════════════════════════════════════════════════
+def build_shap_chart(shap_data):
+    fig = go.Figure(go.Waterfall(
+        orientation="h",
+        measure=["relative"] * len(shap_data),
+        y=[d["feature"] for d in shap_data],
+        x=[d["impact"]  for d in shap_data],
+        connector={"line": {"color": "#21262d"}},
+        decreasing={"marker": {"color": "#f85149"}},
+        increasing={"marker": {"color": "#3fb950"}},
+    ))
+    fig.update_layout(
+        height=320,
+        margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#7d8590", size=11),
+        xaxis=dict(gridcolor="#21262d", zerolinecolor="#388bfd"),
+        yaxis=dict(gridcolor="rgba(0,0,0,0)"),
+    )
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════
+# PAGE 1 — LIVE DASHBOARD
+# ══════════════════════════════════════════════════════════════
+if page == "📡  Live Dashboard":
+
+    data = fetch_analysis(selected_plane)
+    if not data:
+        st.error(f"Could not fetch analysis for **{selected_plane}**. Is the backend running?")
+        st.stop()
+
+    # ── Header ──
+    col_h1, col_h2 = st.columns([3, 1])
+    with col_h1:
+        st.markdown('<div class="aero-header">Live Digital Twin</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="aero-title"><span>{selected_plane}</span></div>', unsafe_allow_html=True)
+    with col_h2:
+        phase = data.get("flight_phase", "unknown").replace("_", " ").title()
+        risk  = data.get("risk_level", "Low")
+        badge_class = {"High": "badge-high", "Moderate": "badge-moderate", "Low": "badge-low"}.get(risk, "badge-low")
+        st.markdown(f"""
+            <div style="text-align:right;padding-top:12px">
+                <span class="badge badge-airborne">● {phase}</span><br><br>
+                <span class="badge {badge_class}">{risk} Risk</span>
+            </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+    # ── KPI Strip ──
+    k1, k2, k3, k4, k5 = st.columns(5)
+    kpis = [
+        (k1, "Predicted RUL",  f"{data['predicted_rul_cycles']}", "cycles",  "kpi-blue"),
+        (k2, "Health Score",   f"{data.get('health_score', 0)}",  "/ 100",   "kpi-green" if data.get('health_score',0) > 60 else "kpi-red"),
+        (k3, "Altitude",       f"{data['live_telemetry']['alt_m']:.0f}", "metres", ""),
+        (k4, "Airspeed",       f"{data['live_telemetry']['speed_ms']:.1f}", "m/s", ""),
+        (k5, "Fuel Burn Est.", f"{data['route_and_emissions']['predicted_fuel_liters']:,.0f}", "litres", ""),
+    ]
+    for col, label, value, unit, cls in kpis:
+        with col:
+            st.markdown(f"""
+                <div class="kpi-card {cls}">
+                    <div class="kpi-label">{label}</div>
+                    <div class="kpi-value">{value}</div>
+                    <div class="kpi-unit">{unit}</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Map + SHAP ──
+    map_col, shap_col = st.columns([1, 1])
+
+    with map_col:
+        st.markdown('<div class="section-title">Live Position & Flight Path</div>', unsafe_allow_html=True)
+        lat = data["live_telemetry"]["lat"]
+        lon = data["live_telemetry"]["lon"]
+        route_data = fetch_route(selected_plane)
+        m = build_map(lat, lon, selected_plane,
+                      data["live_telemetry"]["speed_ms"],
+                      data["live_telemetry"]["alt_m"],
+                      route_data,
+                      callsign=selected_plane)
+        st_folium(m, width=None, height=400, returned_objects=[])
+
+    with shap_col:
+        st.markdown('<div class="section-title">ML Diagnostics — Feature Attribution</div>', unsafe_allow_html=True)
+        st.plotly_chart(
+            build_shap_chart(data["explainability_shap"]),
+            use_container_width=True
         )
-        st.plotly_chart(fig, use_container_width=True)
 
-# ================== PAGE 2: MISSION LOGS ==================
-# ================== PAGE 2: MISSION LOGS ==================
-elif page == "Mission Logs":
-    st.markdown(f'<div class="main-header">Historical Flight Logs: {selected_plane}</div>', unsafe_allow_html=True)
-    
-    # Fetch live history from the API
-    try:
-        hist_response = requests.get(f"{API_BASE_URL}/history/{selected_plane}")
-        history_data = hist_response.json().get("history", [])
-    except:
-        history_data = []
+        # ── Emissions ──
+        st.markdown('<div class="section-title" style="margin-top:16px">Emissions Estimate</div>', unsafe_allow_html=True)
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Wind", f"{data['route_and_emissions']['weather_wind_ms']} m/s")
+        e2.metric("Temp", f"{data['route_and_emissions']['temp_c']}°C")
+        e3.metric("CO₂", f"{data['route_and_emissions']['predicted_co2_kg']:,.0f} kg")
 
-    if history_data:
-        df = pd.DataFrame(history_data)
-        # Rename columns for the UI
-        df.columns = ["Flight ID", "Date", "Route", "Fuel Consumed (L)", "CO2 (kg)", "End Health Score"]
-        
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        
-        st.download_button(
-            label="📥 Download Mission Log (CSV)",
-            data=df.to_csv(index=False).encode('utf-8'),
-            file_name=f"{selected_plane}_history.csv",
-            mime='text/csv',
+
+# ══════════════════════════════════════════════════════════════
+# PAGE 2 — PAKISTAN FLEET
+# ══════════════════════════════════════════════════════════════
+elif page == "🇵🇰  Pakistan Fleet":
+
+    data = fetch_pak_analysis(selected_plane)
+    if not data:
+        st.error(f"No analysis data for **{selected_plane}**. Run `fetch_opensky.py` first.")
+        st.stop()
+
+    # ── Header ──
+    col_h1, col_h2 = st.columns([3, 1])
+    with col_h1:
+        st.markdown('<div class="aero-header">Pakistan Fleet — Digital Twin</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="aero-title"><span>{selected_plane}</span> '
+            f'<span style="font-size:14px;color:#7d8590;font-family:Inter">'
+            f'{selected_pak_data.get("aircraft_type","")} · {selected_pak_data.get("airline","")}'
+            f'</span></div>',
+            unsafe_allow_html=True
         )
-    else:
-        st.info("No historical flights logged for this aircraft yet. Wait for a flight to complete!")
-        
-        # --- HIDDEN TECH LEAD BUTTON ---
-        # A button just for you to test inserting data into Ruhab's table!
-        if st.button("🔧 Force Log a Dummy Flight (Test DB)"):
-            test_data = {
-                "origin": "KHI", "destination": "DXB", 
-                "fuel_liters": 15000, "co2_kg": 38000, "health_score": 45.2
+    with col_h2:
+        risk  = data.get("risk_level", "Low")
+        status = selected_pak_data.get("status", "grounded")
+        badge_class = {"High": "badge-high", "Moderate": "badge-moderate", "Low": "badge-low"}.get(risk, "badge-low")
+        st.markdown(f"""
+            <div style="text-align:right;padding-top:12px">
+                <span class="badge {'badge-airborne' if status=='airborne' else 'badge-grounded'}">
+                    {'● Airborne' if status=='airborne' else '○ Grounded'}
+                </span><br><br>
+                <span class="badge {badge_class}">{risk} Risk</span>
+            </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+    # ── KPI Strip ──
+    k1, k2, k3, k4, k5 = st.columns(5)
+    health = data.get("health_score", 0)
+    kpis = [
+        (k1, "Predicted RUL",  f"{data['predicted_rul_cycles']}", "cycles",  "kpi-blue"),
+        (k2, "Health Score",   f"{health}",  "/ 100", "kpi-green" if health > 60 else "kpi-yellow" if health > 30 else "kpi-red"),
+        (k3, "Altitude",       f"{data['live_telemetry']['alt_m']:.0f}", "metres", ""),
+        (k4, "Airspeed",       f"{data['live_telemetry']['speed_ms']:.1f}", "m/s", ""),
+        (k5, "Fuel Burn Est.", f"{data['route_and_emissions']['predicted_fuel_liters']:,.0f}", "litres", ""),
+    ]
+    for col, label, value, unit, cls in kpis:
+        with col:
+            st.markdown(f"""
+                <div class="kpi-card {cls}">
+                    <div class="kpi-label">{label}</div>
+                    <div class="kpi-value">{value}</div>
+                    <div class="kpi-unit">{unit}</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+    # ── Maintenance Warning ──
+    if data.get("risk_level") == "High" or health < 30:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.error(
+            f"⚠️ **Maintenance Advisory** — {selected_plane} shows elevated risk. "
+            f"RUL: {data['predicted_rul_cycles']} cycles. Health: {health}/100. "
+            f"Recommend inspection before next flight."
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Map + SHAP ──
+    map_col, shap_col = st.columns([1, 1])
+
+    with map_col:
+        st.markdown('<div class="section-title">Live Position & Flight Path</div>', unsafe_allow_html=True)
+        lat = data["live_telemetry"]["lat"] or 30.3753
+        lon = data["live_telemetry"]["lon"] or 69.3451
+        route_data = fetch_route(selected_plane, pak=True)
+        pak_callsign = selected_pak_data.get("callsign") or selected_plane
+        m = build_map(lat, lon, selected_plane,
+                      data["live_telemetry"]["speed_ms"],
+                      data["live_telemetry"]["alt_m"],
+                      route_data,
+                      callsign=pak_callsign)
+        st_folium(m, width=None, height=400, returned_objects=[])
+
+        # ── Soft estimated position notice ──
+        if data.get("anomaly_flag") == 1 or selected_pak_data.get("status") != "airborne":
+            st.markdown(
+                '<p style="font-size:11px;color:#484f58;margin-top:6px;'
+                'letter-spacing:0.5px;">&#x26A0; position estimated from scheduled route '
+                '— live GPS unavailable on free data tier</p>',
+                unsafe_allow_html=True
+            )
+
+    with shap_col:
+        st.markdown('<div class="section-title">ML Diagnostics — Feature Attribution</div>', unsafe_allow_html=True)
+        st.plotly_chart(
+            build_shap_chart(data["explainability_shap"]),
+            use_container_width=True
+        )
+
+        st.markdown('<div class="section-title" style="margin-top:16px">Aircraft Info</div>', unsafe_allow_html=True)
+        info_rows = [
+            ("Registration",   selected_plane),
+            ("Type",           selected_pak_data.get("aircraft_type", "—")),
+            ("Airline",        selected_pak_data.get("airline", "—")),
+            ("ICAO24 Hex",     selected_pak_data.get("hex_code", "—")),
+            ("Flight Phase",   data.get("flight_phase", "—").replace("_", " ").title()),
+            ("ADS-B Score",    str(data.get("iforest_score", "—"))),
+            ("Records Used",   str(data.get("records_used", "—"))),
+        ]
+        for label, value in info_rows:
+            st.markdown(f"""
+                <div class="info-row">
+                    <span class="info-label">{label}</span>
+                    <span class="info-value">{value}</span>
+                </div>
+            """, unsafe_allow_html=True)
+
+    # ── Fleet Overview Table ──
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(f'<div class="section-title">{selected_pak_data.get("airline","")} Fleet Status</div>', unsafe_allow_html=True)
+
+    airline_fleet = [
+        p for p in fetch_pak_fleet()
+        if p.get("airline") == selected_pak_data.get("airline")
+    ]
+    if airline_fleet:
+        df_fleet = pd.DataFrame([{
+            "Tail":    p["tail_number"],
+            "Type":    p.get("aircraft_type", "—"),
+            "Status":  p.get("status", "grounded").title(),
+            "Callsign":p.get("callsign", "—"),
+            "Alt (m)": p.get("altitude") or "—",
+            "Speed":   p.get("velocity") or "—",
+        } for p in airline_fleet])
+
+        st.dataframe(
+            df_fleet,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Status": st.column_config.TextColumn("Status"),
+                "Alt (m)": st.column_config.NumberColumn("Alt (m)", format="%.0f"),
+                "Speed": st.column_config.NumberColumn("Speed (m/s)", format="%.1f"),
             }
-            requests.post(f"{API_BASE_URL}/complete_flight/{selected_plane}", json=test_data)
-            st.success("Flight Logged! Refresh the page.")
+        )
+
+
+# ══════════════════════════════════════════════════════════════
+# PAGE 3 — MISSION LOGS
+# ══════════════════════════════════════════════════════════════
+elif page == "📋  Mission Logs":
+
+    is_pak = page == "📋  Mission Logs" and hasattr(st.session_state, "_pak_mode")
+
+    st.markdown('<div class="aero-header">Flight Records</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="aero-title">Mission Logs — <span>{selected_plane}</span></div>', unsafe_allow_html=True)
+    st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+    # Try pak_history first, fallback to regular history
+    history = fetch_history(selected_plane, pak=False)
+    if not history:
+        history = fetch_history(selected_plane, pak=True)
+
+    if history:
+        df = pd.DataFrame(history)
+        st.markdown('<div class="section-title">Flight History</div>', unsafe_allow_html=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # ── Health Trend ──
+        if "health_score" in df.columns:
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Health Score Trend</div>', unsafe_allow_html=True)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=df.get("flight_id", df.index),
+                y=df["health_score"],
+                mode="lines+markers",
+                line=dict(color="#388bfd", width=2),
+                marker=dict(size=6, color="#f85149",
+                            line=dict(color="#388bfd", width=1)),
+                fill="tozeroy",
+                fillcolor="rgba(31,111,235,0.05)",
+            ))
+            fig.update_layout(
+                height=220,
+                margin=dict(l=10, r=10, t=10, b=10),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#7d8590", size=11),
+                xaxis=dict(gridcolor="#21262d"),
+                yaxis=dict(gridcolor="#21262d", range=[0, 105]),
+                showlegend=False,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.download_button(
+            label="📥  Export CSV",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{selected_plane}_mission_log.csv",
+            mime="text/csv",
+        )
+
+    else:
+        st.info("No mission logs yet for this aircraft.")
+        if st.button("🔧  Insert Test Flight Record"):
+            requests.post(f"{API}/complete_flight/{selected_plane}", json={
+                "origin": "KHI", "destination": "LHE",
+                "fuel_liters": 8500, "co2_kg": 21500, "health_score": 62.0
+            })
+            st.success("Test record inserted — refresh to see it.")
             st.rerun()
