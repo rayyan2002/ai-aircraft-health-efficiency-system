@@ -44,41 +44,50 @@ def fetch_live_flights_pakistan():
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             
+            # Pakistani airline callsign prefixes
+            PAK_PREFIXES   = ("PIA", "ABQ", "ERD", "NL", "SAI", "ORM")
             inserted_count = 0
-            limit = 50 # Let's only save 50 planes per cycle so we don't bloat the DB during tests
+            skipped_count  = 0
+            limit          = 100
 
             for flight in states:
                 if inserted_count >= limit:
                     break
-                    
-                # 1. EXTRACT DATA (Including the physical ICAO24 tail number)
-                icao24_tail = str(flight[0]).strip().upper() if flight[0] else "UNKNOWN"
+
+                # 1. EXTRACT DATA
+                icao24_tail     = str(flight[0]).strip().upper() if flight[0] else "UNKNOWN"
                 active_callsign = str(flight[1]).strip().upper() if flight[1] else "NO_CALL"
-                
+
                 longitude = flight[5]
-                latitude = flight[6]
-                altitude = flight[7]
-                velocity = flight[9]
+                latitude  = flight[6]
+                altitude  = flight[7]
+                velocity  = flight[9]
 
-                # Filter out planes on the ground or missing critical GPS data
-                if altitude is not None and velocity is not None and latitude is not None and longitude is not None:
-                    
-                    # 2. INSERT INTO DATABASE
-                    # Note: You mentioned you have an 'anomaly_flag' column. 
-                    # We pass 0 (False) as the default value here.
-                    cursor.execute("""
-                        INSERT INTO flight_telemetry 
-                        (tail_number, callsign, altitude, velocity, latitude, longitude, anomaly_flag, timestamp) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (icao24_tail, active_callsign, altitude, velocity, latitude, longitude, 0, datetime.now()))
-                    
-                    inserted_count += 1
+                # 2. SKIP non-Pakistani airlines
+                if not any(active_callsign.startswith(p) for p in PAK_PREFIXES):
+                    skipped_count += 1
+                    continue
 
-            # 3. SAVE AND CLOSE
+                # 3. Skip missing GPS data or grounded planes
+                if None in (latitude, longitude, altitude, velocity):
+                    continue
+                if altitude <= 0:
+                    continue
+
+                # 4. INSERT INTO DATABASE
+                cursor.execute("""
+                    INSERT INTO flight_telemetry 
+                    (tail_number, callsign, altitude, velocity, latitude, longitude, anomaly_flag, timestamp) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (icao24_tail, active_callsign, altitude, velocity, latitude, longitude, 0, datetime.now()))
+
+                inserted_count += 1
+                print(f"  ✈️  {active_callsign} | {icao24_tail} | alt={altitude:.0f}m | lat={latitude:.3f} lon={longitude:.3f}")
+
             conn.commit()
             conn.close()
             
-            print(f"💾 Successfully saved {inserted_count} active flights to 'flight_telemetry' table.")
+            print(f"💾 Saved {inserted_count} Pakistani flights | Skipped {skipped_count} foreign airlines.")
 
         elif response.status_code == 429:
             print("❌ Error 429: Rate limit exceeded. Wait a minute before running again.")

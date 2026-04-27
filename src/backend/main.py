@@ -38,8 +38,8 @@ DB_PATH = os.path.join(BASE_DIR, "..", "backend", "aviation_data.db")
 # Pakistan-only airspace bounding box
 # Lat: 23°N to 37.5°N | Lon: 61°E to 78°E
 OPENSKY_PARAMS = {
-    "lamin": 23.0, "lomin": 61.0,
-    "lamax": 37.5, "lomax": 78.0,
+    "lamin": 23.5, "lomin": 60.0,
+    "lamax": 37.5, "lomax": 74.0,
 }
 
 def fetch_and_insert_opensky():
@@ -83,6 +83,11 @@ def fetch_and_insert_opensky():
         saved = 0
         limit = 100
 
+        # Pakistani airline callsign prefixes
+        # Pakistani airline callsign prefixes
+        PAK_PREFIXES = ("PIA", "ABQ", "ERD", "NL", "SAI", "ORM")
+
+        
         for flight in states:
             if saved >= limit:
                 break
@@ -99,6 +104,10 @@ def fetch_and_insert_opensky():
             if alt <= 0:
                 continue
 
+            # ── PAKISTANI AIRLINE FILTER: only save Pakistani-operated flights ──
+            # Skip non-Pakistani airlines
+            if not any(callsign.startswith(p) for p in PAK_PREFIXES):
+                continue
             # ── WHITELIST CHECK: skip planes not in fleet table ──
             if use_whitelist and icao24 not in whitelisted:
                 continue
@@ -424,7 +433,7 @@ def seed_pakistan_fleet(payload: PakistanSeedRequest, db: Session = Depends(get_
         if exists:
             skipped.append(tail)
             continue
-        db.add(models_db.Fleet(tail_number=tail, aircraft_type=p.get("aircraft_type", "Unknown")))
+        db.add(models_db.Fleet(tail_number=tail, aircraft_type=p.get("aircraft_type", "Unknown"),airline= p.get("airline", None)))
         added.append(tail)
 
     db.commit()

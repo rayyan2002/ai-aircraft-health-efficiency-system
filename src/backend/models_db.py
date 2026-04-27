@@ -13,6 +13,7 @@ class Fleet(Base):
     age_years = Column(Float)
     total_flight_hours = Column(Float)
     total_cycles = Column(Integer)
+    airline = Column(String, nullable=True)
 
     # Relationships (Allows us to fetch connected data easily)
     maintenance_logs = relationship("MaintenanceRecord", back_populates="aircraft")

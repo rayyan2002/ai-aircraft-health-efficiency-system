@@ -16,10 +16,7 @@ __pycache__/
 *.npy
 *.h5
 
-# ── Database ──
-*.db
-*.sqlite
-*.sqlite3
+
 
 # ── Jupyter Notebooks Checkpoints ──
 .ipynb_checkpoints/
