@@ -3,101 +3,128 @@ import sqlite3
 from datetime import datetime
 import os
 
-# 1. Get the directory where this script lives (.../src/scripts)
+# ── Paths ──
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR    = os.path.dirname(SCRIPT_DIR)
+DB_PATH    = os.path.join(SRC_DIR, "backend", "aviation_data.db")
 
-# 2. Step up one level to the main 'src' folder (.../src)
-SRC_DIR = os.path.dirname(SCRIPT_DIR)
+# ── AviationStack Config ──
+API_KEY  = "906fb3efbe9699177f8b43380bf32669"
+BASE_URL = "http://api.aviationstack.com/v1/flights"
 
-# 3. Step down into the backend folder where the real DB lives
-DB_PATH = os.path.join(SRC_DIR, "backend", "aviation_data.db")
+# Pakistani airlines ICAO codes
+PAK_AIRLINES = [
+    ("PIA",  "Pakistan International Airlines"),
+    ("ABQ",  "AirBlue"),
+    ("ERD",  "AirSial"),
+    ("SAI",  "SereneAir"),
+    ("ORM",  "Fly Jinnah"),
+]
 
 print(f"🔗 Connecting to database at: {DB_PATH}")
-def fetch_live_flights_pakistan():
+
+
+def fetch_pakistan_flights():
     """
-    Fetches live flight data for Pakistan and saves it to the SQLite database.
+    Fetches live Pakistani airline flights from AviationStack
+    and saves them to the flight_telemetry table.
     """
-    url = "https://opensky-network.org/api/states/all"
+    conn   = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
 
-    # Bounding Box for the pakistan
-    params = {
-    "lamin": 23.0, "lomin": 61.0,
-    "lamax": 37.5, "lomax": 78.0,
-}
+    total_saved   = 0
+    total_skipped = 0
 
-    print("📡 Pinging OpenSky Network API for Pakistani Airspace...")
-    
-    try:
-        response = requests.get(url, params=params, timeout=15)
-        
-        if response.status_code == 200:
-            data = response.json()
-            states = data.get("states")
-            
-            if not states:
-                print("⚠️ No flights currently detected in this bounding box.")
-                return
+    for icao_code, airline_name in PAK_AIRLINES:
+        print(f"\n📡 Fetching {airline_name} ({icao_code}) flights...")
 
-            print(f"✅ Success! Found {len(states)} live flights. Saving to database...")
-            
-            # --- DATABASE CONNECTION ---
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            
-            # Pakistani airline callsign prefixes
-            PAK_PREFIXES   = ("PIA", "ABQ", "ERD", "NL", "SAI", "ORM")
-            inserted_count = 0
-            skipped_count  = 0
-            limit          = 100
+        try:
+            params = {
+                "access_key":    API_KEY,
+                "airline_icao":  icao_code,
+                "flight_status": "active",
+            }
 
-            for flight in states:
-                if inserted_count >= limit:
-                    break
+            resp = requests.get(BASE_URL, params=params, timeout=15)
 
-                # 1. EXTRACT DATA
-                icao24_tail     = str(flight[0]).strip().upper() if flight[0] else "UNKNOWN"
-                active_callsign = str(flight[1]).strip().upper() if flight[1] else "NO_CALL"
+            if resp.status_code == 429:
+                print(f"  ⚠️ Rate limit hit — skipping {icao_code}")
+                continue
+            if resp.status_code == 401:
+                print(f"  ❌ Invalid API key")
+                break
+            if resp.status_code != 200:
+                print(f"  ❌ HTTP {resp.status_code}")
+                continue
 
-                longitude = flight[5]
-                latitude  = flight[6]
-                altitude  = flight[7]
-                velocity  = flight[9]
+            data    = resp.json()
+            flights = data.get("data", [])
 
-                # 2. SKIP non-Pakistani airlines
-                if not any(active_callsign.startswith(p) for p in PAK_PREFIXES):
-                    skipped_count += 1
+            if not flights:
+                print(f"  ⚠️ No active {icao_code} flights right now")
+                continue
+
+            print(f"  ✅ Found {len(flights)} active flights")
+
+            for flight in flights:
+                try:
+                    # Callsign
+                    callsign = (
+                        flight.get("flight", {}).get("icao") or
+                        flight.get("flight", {}).get("iata") or
+                        "UNKNOWN"
+                    ).strip().upper()
+
+                    # Tail number
+                    tail = (flight.get("aircraft") or {}).get("registration", "UNKNOWN")
+                    if tail:
+                        tail = tail.strip().upper()
+
+                    # Live position
+                    live = flight.get("live") or {}
+                    lat  = live.get("latitude")
+                    lon  = live.get("longitude")
+                    alt  = live.get("altitude")          # feet
+                    vel  = live.get("speed_horizontal")  # km/h
+
+                    if None in (lat, lon, alt, vel):
+                        total_skipped += 1
+                        continue
+
+                    # Convert: feet → metres, km/h → m/s
+                    alt_m  = round(alt * 0.3048,  2)
+                    vel_ms = round(vel * 0.27778, 2)
+
+                    if alt_m <= 0:
+                        total_skipped += 1
+                        continue
+
+                    cursor.execute("""
+                        INSERT INTO flight_telemetry
+                        (tail_number, callsign, altitude, velocity,
+                         latitude, longitude, anomaly_flag, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+                    """, (tail, callsign, alt_m, vel_ms,
+                          lat, lon, datetime.now()))
+
+                    total_saved += 1
+                    print(f"  ✈️  {callsign:<10} | {tail:<10} | "
+                          f"alt={alt_m:.0f}m | lat={lat:.3f} lon={lon:.3f}")
+
+                except Exception as e:
+                    print(f"  ⚠️ Error processing flight: {e}")
                     continue
 
-                # 3. Skip missing GPS data or grounded planes
-                if None in (latitude, longitude, altitude, velocity):
-                    continue
-                if altitude <= 0:
-                    continue
+        except requests.exceptions.RequestException as e:
+            print(f"  ❌ Connection error for {icao_code}: {e}")
+            continue
 
-                # 4. INSERT INTO DATABASE
-                cursor.execute("""
-                    INSERT INTO flight_telemetry 
-                    (tail_number, callsign, altitude, velocity, latitude, longitude, anomaly_flag, timestamp) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (icao24_tail, active_callsign, altitude, velocity, latitude, longitude, 0, datetime.now()))
+    conn.commit()
+    conn.close()
 
-                inserted_count += 1
-                print(f"  ✈️  {active_callsign} | {icao24_tail} | alt={altitude:.0f}m | lat={latitude:.3f} lon={longitude:.3f}")
+    print(f"\n💾 Done — Saved {total_saved} Pakistani flights | "
+          f"Skipped {total_skipped} (no live data)")
 
-            conn.commit()
-            conn.close()
-            
-            print(f"💾 Saved {inserted_count} Pakistani flights | Skipped {skipped_count} foreign airlines.")
-
-        elif response.status_code == 429:
-            print("❌ Error 429: Rate limit exceeded. Wait a minute before running again.")
-        else:
-            print(f"❌ Error {response.status_code}: {response.text}")
-
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Connection Error: {e}")
-    except sqlite3.Error as sql_e:
-        print(f"❌ Database Error: {sql_e}")
 
 if __name__ == "__main__":
-    fetch_live_flights_pakistan()
+    fetch_pakistan_flights()
