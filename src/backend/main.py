@@ -372,7 +372,7 @@ except Exception as e:
     print(f"⚠️ WARNING: FYP-1 Models missing or failed: {e}")
 
 try:
-    lstm_model  = tf.keras.models.load_model(LSTM_MODEL_PATH)
+    lstm_model  = tf.keras.models.load_model(LSTM_MODEL_PATH, safe_mode=False)
     lstm_scaler = joblib.load(LSTM_SCALER_PATH)
     print("✅ SUCCESS: FYP-2 Kamal's LSTM & Scaler Loaded")
 except Exception as e:
