@@ -50,20 +50,38 @@ def _init_extra_tables():
         )
     """)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS pipeline_log (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp       TEXT,
-            opensky_saved   INTEGER DEFAULT 0,
-            avstack_saved   INTEGER DEFAULT 0,
-            landings_logged INTEGER DEFAULT 0,
-            errors          TEXT,
-            duration_sec    REAL
+        CREATE TABLE IF NOT EXISTS maintenance_records (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            tail_number      TEXT NOT NULL,
+            component        TEXT,
+            maintenance_type TEXT,
+            location         TEXT,
+            notes            TEXT,
+            performed_at     TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS weather_data (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            city          TEXT NOT NULL,
+            iata_code     TEXT,
+            temp_celsius  REAL,
+            wind_speed_ms REAL,
+            wind_dir_deg  REAL,
+            description   TEXT,
+            fetched_at    TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    for col in ["departure_airport", "arrival_airport"]:
+        try:
+            conn.execute(f"ALTER TABLE pakistan_telemetry ADD COLUMN {col} TEXT")
+        except:
+            pass  # already exists
+
     conn.commit()
     conn.close()
 
-_init_extra_tables()
+_init_extra_tables()   # ← runs on every uvicorn startup
 
 # Pakistan-only airspace bounding box
 # Lat: 23°N to 37.5°N | Lon: 61°E to 78°E
@@ -244,6 +262,11 @@ def fetch_and_insert_aviationstack():
                 callsign = (f.get("flight",{}).get("icao") or f.get("flight",{}).get("iata") or icao_code).strip().upper()
                 ac_type  = _ac_code((f.get("aircraft") or {}).get("iata",""))
                 live     = f.get("live") or {}
+
+                # ── Extract departure / arrival airports ──
+                dep_iata = ((f.get("departure") or {}).get("iata") or "Unknown").upper()
+                arr_iata = ((f.get("arrival")   or {}).get("iata") or "Unknown").upper()
+
                 lat, lon, alt_raw, vel_kh = (
                     live.get("latitude"), live.get("longitude"),
                     live.get("altitude"), live.get("speed_horizontal")
@@ -263,10 +286,12 @@ def fetch_and_insert_aviationstack():
                 cursor.execute("""
                     INSERT INTO pakistan_telemetry
                     (tail_number, callsign, airline, altitude, velocity,
-                     latitude, longitude, anomaly_flag, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     latitude, longitude, anomaly_flag, departure_airport,
+                     arrival_airport, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (tail, callsign, airline_name, alt_m, vel_ms,
-                      lat, lon, 1 if is_est else 0, _datetime.now()))
+                      lat, lon, 1 if is_est else 0,
+                      dep_iata, arr_iata, _datetime.now()))
                 saved += 1
 
         except Exception as e:
@@ -296,6 +321,117 @@ def fetch_and_insert_aviationstack_tracked() -> set:
         return {r[0] for r in rows}
     except:
         return set()
+
+def fetch_and_insert_weather():
+    """
+    Fetches live weather for 4 major Pakistani airports from OpenWeatherMap.
+    Saves to weather_data table. Called by the background worker every cycle.
+    """
+    import requests as _req
+
+    WEATHER_KEY = "4f7ba9337ae4f2f8bd338f49f323662d"
+    WEATHER_URL = "http://api.openweathermap.org/data/2.5/weather"
+
+    # Major Pakistani airports: city name → IATA code
+    AIRPORTS = {
+        "Karachi":    "KHI",
+        "Lahore":     "LHE",
+        "Islamabad":  "ISB",
+        "Peshawar":   "PEW",
+    }
+
+    conn  = _sqlite3.connect(DB_PATH)
+    saved = 0
+
+    for city, iata in AIRPORTS.items():
+        try:
+            resp = _req.get(WEATHER_URL, params={
+                "q":      city,
+                "appid":  WEATHER_KEY,
+                "units":  "metric",
+            }, timeout=10)
+
+            if resp.status_code != 200:
+                print(f"  ⚠️ Weather {city}: HTTP {resp.status_code}")
+                continue
+
+            data = resp.json()
+            temp     = data["main"]["temp"]
+            wind_spd = data["wind"]["speed"]
+            wind_dir = data["wind"].get("deg", 0)
+            desc     = data["weather"][0]["description"].title()
+
+            conn.execute("""
+                INSERT INTO weather_data
+                (city, iata_code, temp_celsius, wind_speed_ms,
+                 wind_dir_deg, description, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (city, iata, temp, wind_spd, wind_dir, desc,
+                  _datetime.now().isoformat()))
+            saved += 1
+
+        except Exception as e:
+            print(f"  ⚠️ Weather {city}: {e}")
+
+    conn.commit()
+    conn.close()
+    if saved:
+        print(f"🌤️ [Weather] Saved {saved} airport weather records.")
+
+
+def get_nearest_airport_weather(lat: float, lon: float) -> dict:
+    """
+    Returns the most recent weather for the nearest Pakistani airport
+    based on aircraft lat/lon. Falls back to Karachi if nothing found.
+    """
+    AIRPORT_COORDS = {
+        "KHI": (24.9008, 67.1681),
+        "LHE": (31.5216, 74.4036),
+        "ISB": (33.6167, 73.0994),
+        "PEW": (33.9939, 71.5146),
+    }
+
+    # Find nearest airport
+    nearest = "KHI"
+    min_dist = float("inf")
+    for iata, (alat, alon) in AIRPORT_COORDS.items():
+        dist = math.sqrt((lat - alat)**2 + (lon - alon)**2)
+        if dist < min_dist:
+            min_dist = dist
+            nearest  = iata
+
+    # Query latest weather for that airport
+    try:
+        conn = _sqlite3.connect(DB_PATH)
+        row  = conn.execute("""
+            SELECT temp_celsius, wind_speed_ms, wind_dir_deg, description
+            FROM weather_data WHERE iata_code = ?
+            ORDER BY fetched_at DESC LIMIT 1
+        """, (nearest,)).fetchone()
+        conn.close()
+
+        if row:
+            return {
+                "airport":    nearest,
+                "temp_c":     row[0],
+                "wind_ms":    row[1],
+                "wind_dir":   row[2],
+                "conditions": row[3],
+                "source":     "live",
+            }
+    except:
+        pass
+
+    # Fallback to ISA estimates
+    return {
+        "airport":    nearest,
+        "temp_c":     compute_temp(8000),
+        "wind_ms":    15.0,
+        "wind_dir":   270,
+        "conditions": "Estimated",
+        "source":     "estimated",
+    }
+
 
 # ──────────────────────────────────────────────────────────────
 # 2. BACKGROUND WORKER
@@ -351,6 +487,14 @@ async def automated_data_pipeline():
                 errors.append(f"aviationstack:{e}")
                 current_active = set()
 
+            # ── Step 3b: Fetch weather for Pakistani airports ──
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, fetch_and_insert_weather
+                )
+            except Exception as e:
+                errors.append(f"weather:{e}")
+
             # ── Step 4: Update fleet_status for active planes ──
             conn_fs = _sqlite3.connect(DB_PATH)
             for tail in current_active:
@@ -369,7 +513,9 @@ async def automated_data_pipeline():
 
                 # Get last known telemetry
                 last_row = conn_fs.execute("""
-                    SELECT altitude, velocity, callsign, departure_airport, arrival_airport
+                    SELECT altitude, velocity, callsign,
+                           COALESCE(departure_airport, 'Unknown') as departure_airport,
+                           COALESCE(arrival_airport, 'Unknown') as arrival_airport
                     FROM pakistan_telemetry
                     WHERE tail_number = ?
                     ORDER BY id DESC LIMIT 1
@@ -1119,10 +1265,35 @@ def analyze_pakistan_aircraft(tail_number: str):
 
     fuel_litres  = compute_fuel_burn(alt, speed, n_records)
     co2_kg       = round(fuel_litres * 2.53, 1)
-    wind_ms      = compute_wind(speed, alt)
-    temp_c       = compute_temp(alt)
+
+    # ── Use real weather from DB, fall back to estimates ──
+    wx        = get_nearest_airport_weather(lat, lon)
+    wind_ms   = wx["wind_ms"]
+    temp_c    = wx["temp_c"]
+    wx_source = wx["source"]
+
     health_score = round(min(100, max(0, predicted_rul / 2)), 1)
     shap_values  = compute_dynamic_shap(alt, speed, if_score, predicted_rul)
+
+    # ── Maintenance override: if maintained within 72 hours → reset health ──
+    try:
+        _conn = get_raw_conn()
+        last_maint = _conn.execute("""
+            SELECT performed_at FROM maintenance_records
+            WHERE tail_number = ?
+            ORDER BY performed_at DESC LIMIT 1
+        """, (tail_number,)).fetchone()
+        _conn.close()
+        if last_maint:
+            from datetime import datetime as _dt2
+            maint_time   = _dt2.fromisoformat(last_maint[0])
+            hours_since  = (_dt2.now() - maint_time).total_seconds() / 3600
+            if hours_since < 72:
+                health_score  = 100.0
+                predicted_rul = 200.0
+                risk_level    = "Low"
+    except:
+        pass
 
     return {
         "tail":                 tail_number,
@@ -1141,10 +1312,13 @@ def analyze_pakistan_aircraft(tail_number: str):
         },
         "explainability_shap": shap_values,
         "route_and_emissions": {
-            "weather_wind_ms":       wind_ms,
-            "temp_c":                temp_c,
+            "weather_wind_ms":    wind_ms,
+            "temp_c":             temp_c,
+            "weather_source":     wx_source,
+            "weather_airport":    wx.get("airport", "KHI"),
+            "weather_conditions": wx.get("conditions", "—"),
             "predicted_fuel_liters": fuel_litres,
-            "predicted_co2_kg":      co2_kg,
+            "predicted_co2_kg":   co2_kg,
         },
         "anomaly_flag":  anomaly_flag,
         "iforest_score": round(if_score, 4),
@@ -1152,7 +1326,37 @@ def analyze_pakistan_aircraft(tail_number: str):
     }
 
 
-@app.get("/api/pak_route/{tail_number}")
+@app.get("/api/weather")
+def get_weather():
+    """Returns latest weather for all 4 Pakistani airports."""
+    conn = get_raw_conn()
+    try:
+        rows = conn.execute("""
+            SELECT city, iata_code, temp_celsius, wind_speed_ms,
+                   wind_dir_deg, description, fetched_at
+            FROM weather_data
+            WHERE id IN (
+                SELECT MAX(id) FROM weather_data GROUP BY iata_code
+            )
+            ORDER BY iata_code
+        """).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return {"weather": [], "message": "No weather data yet — wait for next pipeline cycle"}
+
+    return {"weather": [
+        {
+            "city":        r[0],
+            "iata":        r[1],
+            "temp_c":      r[2],
+            "wind_ms":     r[3],
+            "wind_dir":    r[4],
+            "conditions":  r[5],
+            "fetched_at":  r[6],
+        } for r in rows
+    ]}
 def get_pakistan_route(tail_number: str):
     conn = get_raw_conn()
     try:
@@ -1234,47 +1438,34 @@ def log_maintenance(data: MaintenanceLogRequest, db: Session = Depends(get_db)):
     Mechanic Portal — full implementation.
     Saves maintenance record and resets aircraft health baseline to 100%.
     """
-    # ── 1. Save to maintenance_records ──
-    if not hasattr(models_db, "MaintenanceRecord"):
-        # Graceful fallback if table not yet in models_db
-        conn = get_raw_conn()
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS maintenance_records (
-                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tail_number      TEXT NOT NULL,
-                    component        TEXT,
-                    maintenance_type TEXT,
-                    location         TEXT,
-                    notes            TEXT,
-                    performed_at     TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.execute("""
-                INSERT INTO maintenance_records
-                (tail_number, component, maintenance_type, location, notes, performed_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                data.tail_number, data.component,
-                data.maintenance_type, data.location,
-                data.notes or "", _datetime.now().isoformat()
-            ))
-            conn.commit()
-            record_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        finally:
-            conn.close()
-    else:
-        record = models_db.MaintenanceRecord(
-            tail_number      = data.tail_number,
-            component        = data.component,
-            maintenance_type = data.maintenance_type,
-            location         = data.location,
-            notes            = data.notes or "",
-        )
-        db.add(record)
-        db.commit()
-        db.refresh(record)
-        record_id = record.id
+    # ── 1. Save to maintenance_records via raw SQLite (always) ──
+    conn = get_raw_conn()
+    try:
+        # Ensure table exists with correct schema
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS maintenance_records (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                tail_number      TEXT NOT NULL,
+                component        TEXT,
+                maintenance_type TEXT,
+                location         TEXT,
+                notes            TEXT,
+                performed_at     TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            INSERT INTO maintenance_records
+            (tail_number, component, maintenance_type, location, notes, performed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            data.tail_number, data.component,
+            data.maintenance_type, data.location,
+            data.notes or "", _datetime.now().isoformat()
+        ))
+        conn.commit()
+        record_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    finally:
+        conn.close()
 
     # ── 2. Reset health baseline → insert health_predictions row ──
     if hasattr(models_db, "HealthPrediction"):
@@ -1320,6 +1511,37 @@ def get_maintenance_history(tail_number: str):
     """Returns full maintenance history for a fleet aircraft."""
     conn = get_raw_conn()
     try:
+        # Ensure correct schema exists
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS maintenance_records (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                tail_number      TEXT NOT NULL,
+                component        TEXT,
+                maintenance_type TEXT,
+                location         TEXT,
+                notes            TEXT,
+                performed_at     TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+        # Check if id column exists, if not recreate table
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(maintenance_records)").fetchall()]
+        if "id" not in cols:
+            conn.execute("DROP TABLE maintenance_records")
+            conn.execute("""
+                CREATE TABLE maintenance_records (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tail_number      TEXT NOT NULL,
+                    component        TEXT,
+                    maintenance_type TEXT,
+                    location         TEXT,
+                    notes            TEXT,
+                    performed_at     TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+
         rows = conn.execute("""
             SELECT id, tail_number, component, maintenance_type,
                    location, notes, performed_at

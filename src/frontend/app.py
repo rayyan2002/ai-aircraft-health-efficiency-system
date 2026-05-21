@@ -313,7 +313,8 @@ page = st.sidebar.radio(
 st.sidebar.markdown('<div class="sidebar-section">Aircraft Selection</div>', unsafe_allow_html=True)
 
 # ── Aircraft selection depends on page ──
-if page in ("🇵🇰  Pakistan Fleet", "🔧  Maintenance Portal", "🧮  Flight Simulator"):
+if page in ("🇵🇰  Pakistan Fleet", "🔧  Maintenance Portal",
+            "🧮  Flight Simulator", "📋  Mission Logs"):
     pak_fleet = fetch_pak_fleet()
 
     # Group by airline
@@ -704,16 +705,19 @@ elif page == "🇵🇰  Pakistan Fleet":
 # ══════════════════════════════════════════════════════════════
 elif page == "📋  Mission Logs":
 
-    is_pak = page == "📋  Mission Logs" and hasattr(st.session_state, "_pak_mode")
-
     st.markdown('<div class="aero-header">Flight Records</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="aero-title">Mission Logs — <span>{selected_plane}</span></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="aero-title">Mission Logs — <span>{selected_plane}</span>'
+        f'<span style="font-size:14px;color:#7d8590;font-family:Inter"> · '
+        f'{selected_pak_data.get("airline","")}</span></div>',
+        unsafe_allow_html=True
+    )
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
-    # Try pak_history first, fallback to regular history
-    history = fetch_history(selected_plane, pak=False)
+    # Always use pak_history for fleet aircraft
+    history = fetch_history(selected_plane, pak=True)
     if not history:
-        history = fetch_history(selected_plane, pak=True)
+        history = fetch_history(selected_plane, pak=False)
 
     if history:
         df = pd.DataFrame(history)
@@ -871,6 +875,7 @@ elif page == "🔧  Maintenance Portal":
                     f"✅ Maintenance logged! Health reset to **{result['health_reset_to']}%**. "
                     f"RUL reset to **{result['rul_reset_to']} cycles**."
                 )
+                st.cache_data.clear()
                 st.rerun()
             else:
                 st.error(f"Failed to log maintenance: {resp.text}")
