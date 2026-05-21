@@ -270,6 +270,33 @@ def fetch_history(tail, pak=False):
     return []
 
 
+def fetch_maintenance_history(tail):
+    try:
+        r = requests.get(f"{API}/maintenance_history/{tail}", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("records", [])
+    except:
+        pass
+    return []
+
+def fetch_fleet_status():
+    try:
+        r = requests.get(f"{API}/fleet_status", timeout=5)
+        if r.status_code == 200:
+            return r.json()
+    except:
+        pass
+    return {}
+
+def fetch_pipeline_logs():
+    try:
+        r = requests.get(f"{API}/pipeline_logs", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("logs", [])
+    except:
+        pass
+    return []
+
 # ══════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════
@@ -278,14 +305,15 @@ st.sidebar.markdown('<div class="sidebar-section">Navigation</div>', unsafe_allo
 
 page = st.sidebar.radio(
     "",
-    ["📡  Live Dashboard", "🇵🇰  Pakistan Fleet", "📋  Mission Logs"],
+    ["📡  Live Dashboard", "🇵🇰  Pakistan Fleet",
+     "📋  Mission Logs", "🔧  Maintenance Portal", "🧮  Flight Simulator"],
     label_visibility="collapsed"
 )
 
 st.sidebar.markdown('<div class="sidebar-section">Aircraft Selection</div>', unsafe_allow_html=True)
 
 # ── Aircraft selection depends on page ──
-if page == "🇵🇰  Pakistan Fleet":
+if page in ("🇵🇰  Pakistan Fleet", "🔧  Maintenance Portal", "🧮  Flight Simulator"):
     pak_fleet = fetch_pak_fleet()
 
     # Group by airline
@@ -735,3 +763,244 @@ elif page == "📋  Mission Logs":
             })
             st.success("Test record inserted — refresh to see it.")
             st.rerun()
+
+# ══════════════════════════════════════════════════════════════
+# PAGE 4 — MAINTENANCE PORTAL
+# ══════════════════════════════════════════════════════════════
+elif page == "🔧  Maintenance Portal":
+
+    data = fetch_pak_analysis(selected_plane)
+    health = data.get("health_score", 50) if data else 50
+    risk   = data.get("risk_level", "Low") if data else "Low"
+
+    st.markdown('<div class="aero-header">Mechanic Portal</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="aero-title"><span>{selected_plane}</span> '
+        f'<span style="font-size:14px;color:#7d8590;font-family:Inter">'
+        f'{selected_pak_data.get("aircraft_type","")} · {selected_pak_data.get("airline","")}'
+        f'</span></div>',
+        unsafe_allow_html=True
+    )
+    st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+    # ── Current health strip ──
+    h1, h2, h3 = st.columns(3)
+    h1.markdown(f"""<div class="kpi-card {'kpi-red' if health < 40 else 'kpi-yellow' if health < 70 else 'kpi-green'}">
+        <div class="kpi-label">Current Health</div>
+        <div class="kpi-value">{health}</div>
+        <div class="kpi-unit">/ 100</div></div>""", unsafe_allow_html=True)
+    h2.markdown(f"""<div class="kpi-card {'kpi-red' if risk=='High' else 'kpi-yellow' if risk=='Moderate' else ''}">
+        <div class="kpi-label">Risk Level</div>
+        <div class="kpi-value">{risk}</div>
+        <div class="kpi-unit">current</div></div>""", unsafe_allow_html=True)
+    rul = data.get("predicted_rul_cycles", "—") if data else "—"
+    h3.markdown(f"""<div class="kpi-card kpi-blue">
+        <div class="kpi-label">Predicted RUL</div>
+        <div class="kpi-value">{rul}</div>
+        <div class="kpi-unit">cycles</div></div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    left_col, right_col = st.columns([1, 2])
+
+    # ── Left: component selector ──
+    with left_col:
+        st.markdown('<div class="section-title">Aircraft Components</div>', unsafe_allow_html=True)
+
+        COMPONENTS = [
+            "Engine 1", "Engine 2", "APU",
+            "Landing Gear", "Avionics", "Windshield", "Fuel System"
+        ]
+
+        maint_hist = fetch_maintenance_history(selected_plane)
+        maintained_components = {r["component"] for r in maint_hist}
+
+        selected_component = st.radio(
+            "",
+            COMPONENTS,
+            label_visibility="collapsed",
+            format_func=lambda c: f"✅ {c}" if c in maintained_components else f"⚪ {c}"
+        )
+
+    # ── Right: component detail + maintenance form ──
+    with right_col:
+        st.markdown(f'<div class="section-title">{selected_component} — Maintenance Log</div>',
+                    unsafe_allow_html=True)
+
+        # Show history for this component
+        comp_history = [r for r in maint_hist if r["component"] == selected_component]
+        if comp_history:
+            last = comp_history[0]
+            st.markdown(f"""
+                <div class="info-row"><span class="info-label">Last Maintained</span>
+                <span class="info-value">{last['performed_at'][:10]}</span></div>
+                <div class="info-row"><span class="info-label">Type</span>
+                <span class="info-value">{last['maintenance_type']}</span></div>
+                <div class="info-row"><span class="info-label">Location</span>
+                <span class="info-value">{last['location']}</span></div>
+                <div class="info-row"><span class="info-label">Notes</span>
+                <span class="info-value">{last['notes'] or '—'}</span></div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<p style="color:#484f58;font-size:12px">No maintenance record found for this component.</p>',
+                unsafe_allow_html=True
+            )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Log New Maintenance</div>', unsafe_allow_html=True)
+
+        maint_type = st.selectbox(
+            "Maintenance Type",
+            ["A-check", "B-check", "C-check", "Component replacement", "Inspection"]
+        )
+        location = st.text_input("Location (Airport Code)", value="KHI")
+        notes    = st.text_area("Technician Notes", height=80, placeholder="Optional notes...")
+
+        if st.button("✅  Submit Maintenance Log", use_container_width=True):
+            resp = requests.post(f"{API}/log_maintenance", json={
+                "tail_number":       selected_plane,
+                "component":         selected_component,
+                "maintenance_type":  maint_type,
+                "location":          location,
+                "notes":             notes,
+            })
+            if resp.status_code == 200:
+                result = resp.json()
+                st.success(
+                    f"✅ Maintenance logged! Health reset to **{result['health_reset_to']}%**. "
+                    f"RUL reset to **{result['rul_reset_to']} cycles**."
+                )
+                st.rerun()
+            else:
+                st.error(f"Failed to log maintenance: {resp.text}")
+
+    # ── Full maintenance history table ──
+    if maint_hist:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Full Maintenance History</div>', unsafe_allow_html=True)
+        df_maint = pd.DataFrame(maint_hist)[
+            ["component", "maintenance_type", "location", "performed_at", "notes"]
+        ]
+        df_maint.columns = ["Component", "Type", "Location", "Date", "Notes"]
+        st.dataframe(df_maint, use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════
+# PAGE 5 — FLIGHT SIMULATOR
+# ══════════════════════════════════════════════════════════════
+elif page == "🧮  Flight Simulator":
+
+    st.markdown('<div class="aero-header">Predictive Flight Simulator</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="aero-title"><span>{selected_plane}</span> '
+        f'<span style="font-size:14px;color:#7d8590;font-family:Inter">What-If Analysis</span></div>',
+        unsafe_allow_html=True
+    )
+    st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+    st.markdown(
+        '<p style="color:#7d8590;font-size:13px;margin-bottom:1.5rem">'
+        'Adjust the parameters below to simulate a hypothetical flight and predict '
+        'fuel consumption, CO₂ emissions, and engine health impact.</p>',
+        unsafe_allow_html=True
+    )
+
+    PAK_AIRPORTS = {
+        "KHI - Karachi":      "KHI",
+        "LHE - Lahore":       "LHE",
+        "ISB - Islamabad":    "ISB",
+        "PEW - Peshawar":     "PEW",
+        "MUX - Multan":       "MUX",
+        "LYP - Faisalabad":   "LYP",
+        "SKT - Sialkot":      "SKT",
+        "DXB - Dubai":        "DXB",
+        "DOH - Doha":         "DOH",
+        "JED - Jeddah":       "JED",
+        "LHR - London":       "LHR",
+        "IST - Istanbul":     "IST",
+    }
+
+    f1, f2 = st.columns(2)
+    with f1:
+        dep_label = st.selectbox("Departure Airport", list(PAK_AIRPORTS.keys()), index=0)
+        age       = st.slider("Aircraft Age (years)", 0.0, 30.0,
+                              float(selected_pak_data.get("age_years") or 8.0), 0.5)
+        weather   = st.selectbox("Weather Conditions", ["Clear", "Moderate Wind", "Stormy"])
+
+    with f2:
+        arr_label = st.selectbox("Arrival Airport", list(PAK_AIRPORTS.keys()), index=1)
+        cargo     = st.slider("Cargo Weight (kg)", 0, 50000, 15000, 500)
+        st.markdown("<br>", unsafe_allow_html=True)
+        run_sim   = st.button("🚀  Run Simulation", use_container_width=True)
+
+    if run_sim:
+        with st.spinner("Running simulation..."):
+            resp = requests.post(f"{API}/simulate", json={
+                "tail_number":       selected_plane,
+                "aircraft_age_yrs":  age,
+                "departure_iata":    PAK_AIRPORTS[dep_label],
+                "arrival_iata":      PAK_AIRPORTS[arr_label],
+                "weather":           weather,
+                "cargo_kg":          float(cargo),
+            })
+
+        if resp.status_code == 200:
+            sim = resp.json()["predictions"]
+            flags = [f for f in resp.json().get("risk_flags", []) if f]
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Simulation Results</div>', unsafe_allow_html=True)
+
+            r1, r2, r3, r4 = st.columns(4)
+            metrics = [
+                (r1, "Estimated Fuel",    f"{sim['estimated_fuel_litres']:,.0f}", "litres",  "kpi-blue"),
+                (r2, "CO₂ Emissions",     f"{sim['estimated_co2_kg']:,.0f}",      "kg",      ""),
+                (r3, "Health Impact",     f"{sim['health_impact']}",              "pts",
+                 "kpi-red" if sim["health_impact"] < -5 else "kpi-yellow"),
+                (r4, "Flight Distance",   f"{sim['distance_km']:,.0f}",           "km",      ""),
+            ]
+            for col, label, value, unit, cls in metrics:
+                with col:
+                    st.markdown(f"""<div class="kpi-card {cls}">
+                        <div class="kpi-label">{label}</div>
+                        <div class="kpi-value">{value}</div>
+                        <div class="kpi-unit">{unit}</div></div>""",
+                        unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            detail1, detail2 = st.columns(2)
+            with detail1:
+                st.markdown('<div class="section-title">Flight Details</div>', unsafe_allow_html=True)
+                details = [
+                    ("Route",          f"{PAK_AIRPORTS[dep_label]} → {PAK_AIRPORTS[arr_label]}"),
+                    ("Flight Time",    f"{sim['flight_hours']:.1f} hours"),
+                    ("Next Maintenance",sim["next_maintenance_interval"]),
+                    ("Aircraft Age",   f"{age} years"),
+                    ("Cargo",          f"{cargo:,} kg"),
+                    ("Weather",        weather),
+                ]
+                for label, value in details:
+                    st.markdown(f"""<div class="info-row">
+                        <span class="info-label">{label}</span>
+                        <span class="info-value">{value}</span></div>""",
+                        unsafe_allow_html=True)
+
+            with detail2:
+                if flags:
+                    st.markdown('<div class="section-title">Risk Flags</div>', unsafe_allow_html=True)
+                    for flag in flags:
+                        st.warning(flag)
+                else:
+                    st.markdown('<div class="section-title">Risk Assessment</div>', unsafe_allow_html=True)
+                    st.success("✅ No risk flags for this configuration.")
+        else:
+            st.error(f"Simulation failed: {resp.text}")
+    else:
+        st.markdown(
+            '<div style="text-align:center;padding:3rem;color:#484f58;font-size:13px">'
+            'Configure parameters above and click <b style="color:#388bfd">Run Simulation</b> to see predictions.'
+            '</div>',
+            unsafe_allow_html=True
+        )

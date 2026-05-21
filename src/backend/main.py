@@ -35,6 +35,36 @@ from datetime import datetime as _datetime
 
 DB_PATH = os.path.join(BASE_DIR, "..", "backend", "aviation_data.db")
 
+# ── Create fleet_status + pipeline_log tables on startup ──
+def _init_extra_tables():
+    conn = _sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fleet_status (
+            tail_number       TEXT PRIMARY KEY,
+            status            TEXT DEFAULT 'unknown',
+            last_seen         TEXT,
+            current_callsign  TEXT,
+            departure_airport TEXT,
+            arrival_airport   TEXT,
+            last_flight_id    INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_log (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp       TEXT,
+            opensky_saved   INTEGER DEFAULT 0,
+            avstack_saved   INTEGER DEFAULT 0,
+            landings_logged INTEGER DEFAULT 0,
+            errors          TEXT,
+            duration_sec    REAL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+_init_extra_tables()
+
 # Pakistan-only airspace bounding box
 # Lat: 23°N to 37.5°N | Lon: 61°E to 78°E
 OPENSKY_PARAMS = {
@@ -246,83 +276,205 @@ def fetch_and_insert_aviationstack():
     conn.close()
     print(f"✅ [AviationStack] Saved {saved} flights to pakistan_telemetry.")
 
+
+def fetch_and_insert_aviationstack_tracked() -> set:
+    """
+    Same as fetch_and_insert_aviationstack but also returns
+    the set of tail_numbers that are currently active.
+    Used by absence detection in the background worker.
+    """
+    fetch_and_insert_aviationstack()
+    # Read back which tails were just inserted in the last 10 minutes
+    try:
+        c = _sqlite3.connect(DB_PATH)
+        rows = c.execute("""
+            SELECT DISTINCT tail_number FROM pakistan_telemetry
+            WHERE tail_number != 'UNKNOWN'
+            AND timestamp >= datetime('now', '-10 minutes')
+        """).fetchall()
+        c.close()
+        return {r[0] for r in rows}
+    except:
+        return set()
+
 # ──────────────────────────────────────────────────────────────
 # 2. BACKGROUND WORKER
 # ──────────────────────────────────────────────────────────────
+def _get_row_count(table: str) -> int:
+    try:
+        c = _sqlite3.connect(DB_PATH)
+        n = c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        c.close()
+        return n
+    except:
+        return 0
+
+
 async def automated_data_pipeline():
-    """Runs every 5 minutes — fetches live OpenSky data + auto-lands planes."""
+    """Runs every 5 minutes — fetches live data, detects landings, logs every cycle."""
     while True:
         print("🔄 [HEARTBEAT] Running Automated Data Pipeline...")
+        cycle_start    = _datetime.now()
+        opensky_saved  = 0
+        avstack_saved  = 0
+        landings_logged= 0
+        errors         = []
         db = SessionLocal()
+
         try:
-            # ── Fetch live OpenSky data → flight_telemetry (Live Dashboard) ──
-            await asyncio.get_event_loop().run_in_executor(
-                None, fetch_and_insert_opensky
+            # ── Step 1: snapshot active tails BEFORE fetch ──
+            conn_snap = _sqlite3.connect(DB_PATH)
+            prev_active = set(
+                r[0] for r in conn_snap.execute(
+                    "SELECT tail_number FROM fleet_status WHERE status='airborne'"
+                ).fetchall()
             )
-            # ── Fetch AviationStack data → pakistan_telemetry (Fleet page) ──
-            await asyncio.get_event_loop().run_in_executor(
-                None, fetch_and_insert_aviationstack
-            )
+            conn_snap.close()
 
-            # ── Auto-lander: detect landed planes and log to history ──
+            # ── Step 2: Fetch OpenSky → flight_telemetry ──
+            try:
+                before = _get_row_count("flight_telemetry")
+                await asyncio.get_event_loop().run_in_executor(None, fetch_and_insert_opensky)
+                opensky_saved = _get_row_count("flight_telemetry") - before
+            except Exception as e:
+                errors.append(f"opensky:{e}")
+
+            # ── Step 3: Fetch AviationStack → pakistan_telemetry ──
+            # Also collect which tails are active this cycle
+            try:
+                before = _get_row_count("pakistan_telemetry")
+                current_active = await asyncio.get_event_loop().run_in_executor(
+                    None, fetch_and_insert_aviationstack_tracked
+                )
+                avstack_saved = _get_row_count("pakistan_telemetry") - before
+            except Exception as e:
+                errors.append(f"aviationstack:{e}")
+                current_active = set()
+
+            # ── Step 4: Update fleet_status for active planes ──
+            conn_fs = _sqlite3.connect(DB_PATH)
+            for tail in current_active:
+                conn_fs.execute("""
+                    INSERT INTO fleet_status (tail_number, status, last_seen)
+                    VALUES (?, 'airborne', ?)
+                    ON CONFLICT(tail_number) DO UPDATE SET
+                        status='airborne', last_seen=excluded.last_seen
+                """, (tail, _datetime.now().isoformat()))
+            conn_fs.commit()
+
+            # ── Step 5: Absence detection — who just landed? ──
+            just_landed = prev_active - current_active
+            for tail in just_landed:
+                print(f"🛬 ABSENCE DETECTED — {tail} no longer active. Logging flight...")
+
+                # Get last known telemetry
+                last_row = conn_fs.execute("""
+                    SELECT altitude, velocity, callsign, departure_airport, arrival_airport
+                    FROM pakistan_telemetry
+                    WHERE tail_number = ?
+                    ORDER BY id DESC LIMIT 1
+                """, (tail,)).fetchone()
+
+                if last_row:
+                    alt_last = last_row[0] or 0
+                    vel_last = last_row[1] or 0
+                    callsign = last_row[2] or tail
+                    origin   = last_row[3] or "Unknown"
+                    dest     = last_row[4] or "Unknown"
+                else:
+                    alt_last = vel_last = 0
+                    callsign = tail
+                    origin   = dest = "Unknown"
+
+                # Calculate metrics
+                fuel = round(compute_fuel_burn(alt_last, vel_last, 30), 1)
+                co2  = round(fuel * 2.53, 1)
+
+                final_health = 45.2
+                if lstm_model and lstm_scaler:
+                    try:
+                        sd = np.zeros((30, 24))
+                        sd[:, 0] = alt_last / 1000
+                        sd[:, 1] = vel_last
+                        scaled = lstm_scaler.transform(sd)
+                        rul = float(lstm_model.predict(scaled.reshape(1,30,24), verbose=0)[0][0])
+                        final_health = round(min(100, max(0, rul / 2)), 1)
+                    except:
+                        pass
+
+                # Insert into flight_history
+                db.add(models_db.FlightHistory(
+                    tail_number       = tail,
+                    origin            = origin,
+                    destination       = dest,
+                    total_fuel_liters = fuel,
+                    co2_kg            = co2,
+                    final_health_score= final_health,
+                ))
+                db.commit()
+                landings_logged += 1
+
+                # Update fleet_status to grounded
+                conn_fs.execute("""
+                    UPDATE fleet_status SET status='grounded', last_seen=?
+                    WHERE tail_number=?
+                """, (_datetime.now().isoformat(), tail))
+                conn_fs.commit()
+                print(f"  ✅ {tail} → flight_history | fuel={fuel}L health={final_health}")
+
+            conn_fs.close()
+
+            # ── Step 6: Legacy auto-lander on flight_telemetry ──
             flying_planes = db.query(models_db.FlightTelemetry.callsign).distinct().all()
-
             for plane in flying_planes:
                 tail = plane[0]
                 if not tail:
                     continue
-
                 recent_logs = db.query(models_db.FlightTelemetry)\
                                 .filter(models_db.FlightTelemetry.callsign == tail)\
                                 .order_by(models_db.FlightTelemetry.timestamp.desc())\
                                 .limit(2).all()
-
                 if len(recent_logs) == 2:
-                    current_log  = recent_logs[0]
-                    previous_log = recent_logs[1]
-
-                    if previous_log.altitude > 0 and current_log.altitude <= 0:
-                        print(f"🛬 DETECTED LANDING: {tail}. Moving to History...")
-
-                        # ── Dynamic health score from LSTM ──
-                        final_health = 45.2
-                        if lstm_model and lstm_scaler:
-                            try:
-                                sensor_data = np.zeros((30, 24))
-                                sensor_data[:, 0] = (current_log.altitude or 0) / 1000
-                                sensor_data[:, 1] = (current_log.velocity or 0)
-                                scaled = lstm_scaler.transform(sensor_data)
-                                rul = float(lstm_model.predict(
-                                    scaled.reshape(1, 30, 24), verbose=0
-                                )[0][0])
-                                final_health = round(min(100, max(0, rul / 2)), 1)
-                            except:
-                                pass
-
-                        # ── Dynamic fuel & CO2 ──
-                        fuel = round(compute_fuel_burn(
-                            current_log.altitude or 0,
-                            current_log.velocity or 0,
-                            30
-                        ), 1)
-
-                        new_history = models_db.FlightHistory(
-                            tail_number=tail,
-                            origin="Unknown (Auto-Detect)",
-                            destination="Current Coords",
-                            total_fuel_liters=fuel,
-                            co2_kg=round(fuel * 2.53, 1),
-                            final_health_score=final_health,
-                        )
-                        db.add(new_history)
+                    cur = recent_logs[0]
+                    prv = recent_logs[1]
+                    if (prv.altitude or 0) > 0 and (cur.altitude or 0) <= 0:
+                        fuel = round(compute_fuel_burn(cur.altitude or 0, cur.velocity or 0, 30), 1)
+                        db.add(models_db.FlightHistory(
+                            tail_number=tail, origin="Auto-Detect", destination="Auto-Detect",
+                            total_fuel_liters=fuel, co2_kg=round(fuel*2.53,1), final_health_score=45.2
+                        ))
                         db.commit()
-                        print(f"✅ Saved {tail} — fuel={fuel}L health={final_health}")
 
         except Exception as e:
+            errors.append(f"pipeline:{e}")
             print(f"⚠️ Pipeline Error: {e}")
             db.rollback()
         finally:
             db.close()
+
+        # ── Step 7: Log this cycle ──
+        duration  = round((_datetime.now() - cycle_start).total_seconds(), 1)
+        error_str = " | ".join(errors) if errors else "none"
+        log_line  = (
+            f"{cycle_start.strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"opensky={opensky_saved} | avstack={avstack_saved} | "
+            f"landings={landings_logged} | errors={error_str} | duration={duration}s"
+        )
+        print(f"📝 {log_line}")
+
+        # Write to pipeline_log table
+        try:
+            c = _sqlite3.connect(DB_PATH)
+            c.execute("""
+                INSERT INTO pipeline_log
+                (timestamp, opensky_saved, avstack_saved, landings_logged, errors, duration_sec)
+                VALUES (?,?,?,?,?,?)
+            """, (cycle_start.isoformat(), opensky_saved, avstack_saved,
+                  landings_logged, error_str, duration))
+            c.commit()
+            c.close()
+        except Exception as e:
+            print(f"⚠️ Log write failed: {e}")
 
         print("💤 [HEARTBEAT] Sleeping 5 minutes...")
         await asyncio.sleep(300)
@@ -406,15 +558,19 @@ class PakistanSeedRequest(BaseModel):
     planes: List[dict]
 
 class SimulateRequest(BaseModel):
-    tail_number:      str
-    aircraft_age_yrs: float = 8.0
-    weather:          str   = "Clear"
-    cargo_kg:         float = 15000.0
+    tail_number:       str
+    aircraft_age_yrs:  float = 8.0
+    departure_iata:    str   = "KHI"
+    arrival_iata:      str   = "LHE"
+    weather:           str   = "Clear"
+    cargo_kg:          float = 15000.0
 
 class MaintenanceLogRequest(BaseModel):
-    tail_number:      str
-    maintenance_type: str
-    notes:            Optional[str] = None
+    tail_number:       str
+    component:         str              # Engine 1/Engine 2/APU/Landing Gear/Avionics/Windshield/Fuel System
+    maintenance_type:  str              # A-check/B-check/C-check/Component replacement/Inspection
+    location:          str   = "KHI"
+    notes:             Optional[str] = None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1075,24 +1231,269 @@ def get_pakistan_history(tail_number: str, db: Session = Depends(get_db)):
 @app.post("/api/log_maintenance")
 def log_maintenance(data: MaintenanceLogRequest, db: Session = Depends(get_db)):
     """
-    Sprint 4: Mechanic Portal.
-    Will log maintenance event + reset engine health baseline to 100%.
+    Mechanic Portal — full implementation.
+    Saves maintenance record and resets aircraft health baseline to 100%.
     """
+    # ── 1. Save to maintenance_records ──
+    if not hasattr(models_db, "MaintenanceRecord"):
+        # Graceful fallback if table not yet in models_db
+        conn = get_raw_conn()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS maintenance_records (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tail_number      TEXT NOT NULL,
+                    component        TEXT,
+                    maintenance_type TEXT,
+                    location         TEXT,
+                    notes            TEXT,
+                    performed_at     TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                INSERT INTO maintenance_records
+                (tail_number, component, maintenance_type, location, notes, performed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                data.tail_number, data.component,
+                data.maintenance_type, data.location,
+                data.notes or "", _datetime.now().isoformat()
+            ))
+            conn.commit()
+            record_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        finally:
+            conn.close()
+    else:
+        record = models_db.MaintenanceRecord(
+            tail_number      = data.tail_number,
+            component        = data.component,
+            maintenance_type = data.maintenance_type,
+            location         = data.location,
+            notes            = data.notes or "",
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        record_id = record.id
+
+    # ── 2. Reset health baseline → insert health_predictions row ──
+    if hasattr(models_db, "HealthPrediction"):
+        db.add(models_db.HealthPrediction(
+            tail_number          = data.tail_number,
+            health_score         = 100.0,
+            predicted_rul_cycles = 200,
+            shap_top_feature     = "maintenance_reset",
+        ))
+        db.commit()
+
+    # ── 3. Update fleet_status maintenance fields ──
+    try:
+        conn = get_raw_conn()
+        conn.execute("""
+            UPDATE fleet_status
+            SET status='grounded', last_seen=?
+            WHERE tail_number=?
+        """, (_datetime.now().isoformat(), data.tail_number))
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
+    print(f"🔧 Maintenance logged: {data.tail_number} — {data.component} — {data.maintenance_type}")
+
     return {
-        "status":      "shell",
-        "message":     f"Maintenance endpoint ready for Sprint 4.",
-        "tail_number": data.tail_number,
+        "status":          "success",
+        "record_id":       record_id,
+        "tail_number":     data.tail_number,
+        "component":       data.component,
+        "maintenance_type":data.maintenance_type,
+        "location":        data.location,
+        "performed_at":    _datetime.now().isoformat(),
+        "health_reset_to": 100,
+        "rul_reset_to":    200,
+        "message":         f"Maintenance logged for {data.tail_number}. Health baseline reset to 100%.",
     }
+
+
+@app.get("/api/maintenance_history/{tail_number}")
+def get_maintenance_history(tail_number: str):
+    """Returns full maintenance history for a fleet aircraft."""
+    conn = get_raw_conn()
+    try:
+        rows = conn.execute("""
+            SELECT id, tail_number, component, maintenance_type,
+                   location, notes, performed_at
+            FROM maintenance_records
+            WHERE tail_number = ?
+            ORDER BY performed_at DESC
+            LIMIT 20
+        """, (tail_number,)).fetchall()
+    finally:
+        conn.close()
+
+    return {"tail_number": tail_number, "records": [
+        {
+            "id":               r[0],
+            "tail_number":      r[1],
+            "component":        r[2],
+            "maintenance_type": r[3],
+            "location":         r[4],
+            "notes":            r[5],
+            "performed_at":     r[6],
+        } for r in rows
+    ]}
 
 
 @app.post("/api/simulate")
 def simulate_flight(data: SimulateRequest):
     """
-    Sprint 4: Predictive Simulator.
-    Dispatcher inputs hypothetical variables → predicted fuel + health impact.
+    Predictive Simulator — full implementation.
+    Dispatcher inputs hypothetical variables → predicted fuel, CO2, health impact.
     """
+    # ── Airport coordinates for distance calculation ──
+    AIRPORT_COORDS = {
+        "KHI":(24.9008,67.1681), "LHE":(31.5216,74.4036),
+        "ISB":(33.6167,73.0994), "PEW":(33.9939,71.5146),
+        "MUX":(30.2032,71.4191), "LYP":(31.3600,72.9947),
+        "SKT":(32.5356,74.3639), "UET":(30.2512,66.9378),
+        "GWD":(25.2330,62.3294), "DXB":(25.2532,55.3657),
+        "DOH":(25.2731,51.6080), "JED":(21.6796,39.1565),
+        "RUH":(24.9578,46.6989), "LHR":(51.4700,-0.4543),
+        "IST":(41.2608,28.7418),
+    }
+
+    dep = AIRPORT_COORDS.get(data.departure_iata.upper(), (24.9, 67.1))
+    arr = AIRPORT_COORDS.get(data.arrival_iata.upper(), (31.5, 74.4))
+
+    # ── Distance in km ──
+    dist_km = round(math.sqrt(
+        ((arr[0]-dep[0])*111)**2 + ((arr[1]-dep[1])*111)**2
+    ), 1)
+
+    # ── Base flight time in hours ──
+    cruise_speed_kmh = 850
+    flight_hours = dist_km / cruise_speed_kmh
+
+    # ── Base fuel (litres/hour varies by aircraft age) ──
+    base_burn_lph = 3200 + (data.aircraft_age_yrs * 50)
+
+    # ── Weather multiplier ──
+    weather_mult = {"Clear": 1.0, "Moderate Wind": 1.08, "Stormy": 1.18}.get(data.weather, 1.0)
+
+    # ── Cargo weight multiplier (every 10,000 kg adds ~2% fuel) ──
+    cargo_mult = 1.0 + (data.cargo_kg / 10000) * 0.02
+
+    # ── Estimated fuel ──
+    estimated_fuel = round(base_burn_lph * flight_hours * weather_mult * cargo_mult, 1)
+    estimated_co2  = round(estimated_fuel * 2.53, 1)
+
+    # ── Health impact — older aircraft + heavy cargo + bad weather degrades faster ──
+    age_factor     = min(data.aircraft_age_yrs / 20, 1.0)
+    cargo_factor   = min(data.cargo_kg / 50000, 1.0)
+    weather_factor = {"Clear": 0.0, "Moderate Wind": 0.1, "Stormy": 0.25}.get(data.weather, 0.0)
+    health_impact  = round((age_factor * 5 + cargo_factor * 3 + weather_factor * 7) * -1, 1)
+
+    # ── Next maintenance interval ──
+    if data.aircraft_age_yrs > 15:
+        next_maint = "Within 50 flight cycles"
+    elif data.aircraft_age_yrs > 8:
+        next_maint = "Within 150 flight cycles"
+    else:
+        next_maint = "Within 300 flight cycles"
+
+    if data.weather == "Stormy":
+        next_maint = "Inspect after landing — stormy conditions"
+
     return {
-        "status":  "shell",
-        "message": "Simulator endpoint ready for Sprint 4.",
-        "inputs":  data.model_dump(),
+        "status": "success",
+        "inputs": {
+            "tail_number":      data.tail_number,
+            "aircraft_age_yrs": data.aircraft_age_yrs,
+            "departure":        data.departure_iata.upper(),
+            "arrival":          data.arrival_iata.upper(),
+            "weather":          data.weather,
+            "cargo_kg":         data.cargo_kg,
+        },
+        "predictions": {
+            "distance_km":              dist_km,
+            "flight_hours":             round(flight_hours, 2),
+            "estimated_fuel_litres":    estimated_fuel,
+            "estimated_co2_kg":         estimated_co2,
+            "health_impact":            health_impact,
+            "next_maintenance_interval":next_maint,
+        },
+        "risk_flags": [
+            f"Aircraft age {data.aircraft_age_yrs}yrs — increased wear expected"
+            if data.aircraft_age_yrs > 12 else None,
+            f"Heavy cargo {data.cargo_kg:,.0f}kg — elevated fuel burn"
+            if data.cargo_kg > 30000 else None,
+            f"Stormy weather — recommend delay or alternate route"
+            if data.weather == "Stormy" else None,
+        ],
+    }
+
+
+@app.get("/api/pipeline_logs")
+def get_pipeline_logs():
+    """Returns last 50 pipeline cycle logs for system health monitoring."""
+    conn = get_raw_conn()
+    try:
+        rows = conn.execute("""
+            SELECT timestamp, opensky_saved, avstack_saved,
+                   landings_logged, errors, duration_sec
+            FROM pipeline_log
+            ORDER BY id DESC LIMIT 50
+        """).fetchall()
+    except:
+        return {"logs": [], "message": "pipeline_log table not yet created"}
+    finally:
+        conn.close()
+
+    return {"logs": [
+        {
+            "timestamp":       r[0],
+            "opensky_saved":   r[1],
+            "avstack_saved":   r[2],
+            "landings_logged": r[3],
+            "errors":          r[4],
+            "duration_sec":    r[5],
+        } for r in rows
+    ]}
+
+
+@app.get("/api/fleet_status")
+def get_fleet_status():
+    """Returns current airborne/grounded status for all fleet planes."""
+    conn = get_raw_conn()
+    try:
+        rows = conn.execute("""
+            SELECT f.tail_number, f.airline, f.aircraft_type,
+                   COALESCE(fs.status, 'unknown') as status,
+                   fs.last_seen, fs.current_callsign,
+                   fs.departure_airport, fs.arrival_airport
+            FROM fleet f
+            LEFT JOIN fleet_status fs ON fs.tail_number = f.tail_number
+            ORDER BY f.airline, f.tail_number
+        """).fetchall()
+    finally:
+        conn.close()
+
+    airborne = sum(1 for r in rows if r[3] == "airborne")
+    grounded = sum(1 for r in rows if r[3] == "grounded")
+
+    return {
+        "summary":  {"airborne": airborne, "grounded": grounded,
+                     "unknown": len(rows) - airborne - grounded},
+        "aircraft": [
+            {
+                "tail_number":    r[0],
+                "airline":        r[1],
+                "aircraft_type":  r[2],
+                "status":         r[3],
+                "last_seen":      r[4],
+                "callsign":       r[5],
+                "departure":      r[6],
+                "arrival":        r[7],
+            } for r in rows
+        ],
     }
