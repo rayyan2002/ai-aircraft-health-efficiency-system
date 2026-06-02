@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 import numpy as np
@@ -643,6 +644,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 def get_db():
     db = SessionLocal()
@@ -1238,20 +1247,66 @@ def analyze_pakistan_aircraft(tail_number: str):
 
         if lstm_model and lstm_scaler:
             try:
-                df          = pd.DataFrame([{"altitude": dict(h).get("altitude") or 0,
-                                              "velocity": dict(h).get("velocity") or 0}
-                                             for h in history])
-                sensor_data = np.zeros((len(df), 24))
-                sensor_data[:, 0] = df["altitude"].fillna(0) / 1000
-                sensor_data[:, 1] = df["velocity"].fillna(0)
+                # ── Build richer sensor input using all available telemetry ──
+                # Get aircraft age from fleet table for degradation baseline
+                fleet_age = 0
+                fleet_hours = 0
+                try:
+                    _fc = get_raw_conn()
+                    _fr = _fc.execute(
+                        "SELECT age_years, total_flight_hours FROM fleet WHERE tail_number=?",
+                        (tail_number,)
+                    ).fetchone()
+                    _fc.close()
+                    if _fr:
+                        fleet_age   = float(_fr[0] or 0)
+                        fleet_hours = float(_fr[1] or 0)
+                except:
+                    pass
+
+                # Build sequence from all available history rows
+                rows = [dict(h) for h in history]
+
+                # Map available fields to CMAPSS-like sensor channels
+                # ch0=alt/1000, ch1=vel, ch2=vrate, ch3=track/360,
+                # ch4=age_factor, ch5=if_score, ch6-23=derived
+                sensor_data = np.zeros((len(rows), 24))
+                for i, row in enumerate(rows):
+                    a = row.get("altitude") or alt
+                    v = row.get("velocity") or speed
+                    sensor_data[i, 0]  = a / 1000                    # altitude km
+                    sensor_data[i, 1]  = v / 300                     # velocity normalized
+                    sensor_data[i, 2]  = vertical_rate / 100          # vertical rate
+                    sensor_data[i, 3]  = true_track / 360             # track normalized
+                    sensor_data[i, 4]  = fleet_age / 20               # age factor
+                    sensor_data[i, 5]  = fleet_hours / 50000          # hours factor
+                    sensor_data[i, 6]  = abs(if_score)                # anomaly magnitude
+                    sensor_data[i, 7]  = a / 12000                    # alt pressure proxy
+                    sensor_data[i, 8]  = v * fleet_age / 3000         # wear proxy
+                    sensor_data[i, 9]  = (a - 8000) / 4000            # cruise deviation
+                    # Fill remaining channels with noise-free constants
+                    sensor_data[i, 10] = 0.95 - (fleet_age * 0.01)   # efficiency
+                    sensor_data[i, 11] = v / 250                       # fan speed proxy
+                    sensor_data[i, 12] = 1.0 - (fleet_hours / 100000) # cycle health
+
                 scaled = lstm_scaler.transform(sensor_data)
                 if len(scaled) < 30:
-                    scaled = np.vstack([np.zeros((30 - len(scaled), 24)), scaled])
+                    # Pad with slightly varied values rather than pure zeros
+                    pad = np.tile(scaled[0], (30 - len(scaled), 1))
+                    pad += np.random.default_rng(
+                        abs(hash(tail_number)) % (2**32)
+                    ).normal(0, 0.01, pad.shape)
+                    scaled = np.vstack([pad, scaled])
                 else:
                     scaled = scaled[:30]
+
                 predicted_rul = float(
                     lstm_model.predict(scaled.reshape(1, 30, 24), verbose=0)[0][0]
                 )
+                # Clamp to realistic range
+                predicted_rul = max(5.0, min(200.0, predicted_rul))
+                print(f"🎯 PAK LSTM [{tail_number}]: RUL={predicted_rul:.1f} age={fleet_age}yrs")
+
             except Exception as e:
                 print(f"⚠️ LSTM failed for {tail_number}: {e}")
 

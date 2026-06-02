@@ -46,4 +46,4 @@ desktop.ini
 # ── Build ──
 dist/
 build/
-*.egg-info/
+*.egg-info/frontend-react/node_modules/
