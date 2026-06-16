@@ -1038,7 +1038,9 @@ def analyze_aircraft_live(tail_number: str, db: Session = Depends(get_db)):
     co2_kg       = round(fuel_litres * 2.53, 1)
     wind_ms      = compute_wind(speed, alt)
     temp_c       = compute_temp(alt)
-    health_score = round(min(100, max(0, predicted_rul / 2)), 1)
+    # Map RUL to a 0-100 health scale. 5/123 are the empirical floor/ceiling
+    # from diagnose_lstm.py (z-score cliff), so the newest aircraft show green 80+.
+    health_score = round(min(100, max(0, (predicted_rul - 5) / (123 - 5) * 100)), 1)
     shap_values  = compute_dynamic_shap(alt, speed, if_score, predicted_rul)
 
     return {
@@ -1245,78 +1247,78 @@ def analyze_pakistan_aircraft(tail_number: str):
 
         anomaly_flag, if_score = run_iforest(speed, alt, vertical_rate, true_track)
 
-        if lstm_model and lstm_scaler:
-            try:
-                # ── Get aircraft cycles for degradation mapping ──
-                fleet_age = float(fleet_row.get("age_years") or 8)
-                fleet_cycles = float(fleet_row.get("total_cycles") or 15000)
+    if lstm_model and lstm_scaler:
+        try:
+            # ── Get aircraft cycles for degradation mapping ──
+            fleet_age = float(fleet_row.get("age_years") or 8)
+            fleet_cycles = float(fleet_row.get("total_cycles") or 15000)
 
-                # ── Map aircraft to a point on the CMAPSS degradation curve ──
-                # CMAPSS engines run ~125-360 cycles before failure in the dataset.
-                # We map real aircraft cycles to a *wear fraction* (0=new, 1=end of life)
-                # using a typical commercial engine design life of ~50,000 cycles.
-                DESIGN_LIFE_CYCLES = 50000
-                wear_fraction = min(0.95, fleet_cycles / DESIGN_LIFE_CYCLES)
+            # ── Map aircraft to a point on the CMAPSS degradation curve ──
+            # CMAPSS engines run ~125-360 cycles before failure in the dataset.
+            # We map real aircraft cycles to a *wear fraction* (0=new, 1=end of life)
+            # using a typical commercial engine design life of ~50,000 cycles.
+            DESIGN_LIFE_CYCLES = 50000
+            wear_fraction = min(0.95, fleet_cycles / DESIGN_LIFE_CYCLES)
 
-                # CMAPSS sensors degrade monotonically as wear increases.
-                # These baseline values are the typical normalized operating
-                # points from the NASA CMAPSS FD001 training set. As wear rises,
-                # each sensor drifts toward its failure-point value.
-                # (healthy_value, failure_value) per sensor channel
-                CMAPSS_PROFILE = [
-                    (0.45, 0.55),  # s0  fan inlet temp
-                    (0.50, 0.62),  # s1  LPC outlet temp
-                    (0.55, 0.70),  # s2  HPC outlet temp
-                    (0.40, 0.52),  # s3  LPT outlet temp
-                    (0.48, 0.45),  # s4  fan inlet pressure (drops)
-                    (0.52, 0.66),  # s5  bypass pressure
-                    (0.50, 0.63),  # s6  HPC outlet pressure
-                    (0.47, 0.38),  # s7  physical fan speed (drops)
-                    (0.53, 0.68),  # s8  physical core speed
-                    (0.49, 0.61),  # s9  engine pressure ratio
-                    (0.51, 0.64),  # s10 HPC static pressure
-                    (0.46, 0.40),  # s11 fuel flow ratio (drops)
-                    (0.50, 0.65),  # s12 corrected fan speed
-                    (0.52, 0.67),  # s13 corrected core speed
-                    (0.48, 0.60),  # s14 bypass ratio
-                    (0.50, 0.63),  # s15 burner fuel-air ratio
-                    (0.47, 0.58),  # s16 bleed enthalpy
-                    (0.49, 0.39),  # s17 demanded fan speed (drops)
-                    (0.51, 0.64),  # s18 demanded corrected fan speed
-                    (0.48, 0.59),  # s19 HPT coolant bleed
-                    (0.50, 0.62),  # s20 LPT coolant bleed
-                    (0.46, 0.57),  # s21 (aux)
-                    (0.49, 0.60),  # s22 (aux)
-                    (0.50, 0.61),  # s23 (aux)
-                ]
+            # CMAPSS sensors degrade monotonically as wear increases.
+            # These baseline values are the typical normalized operating
+            # points from the NASA CMAPSS FD001 training set. As wear rises,
+            # each sensor drifts toward its failure-point value.
+            # (healthy_value, failure_value) per sensor channel
+            CMAPSS_PROFILE = [
+                (0.45, 0.55),  # s0  fan inlet temp
+                (0.50, 0.62),  # s1  LPC outlet temp
+                (0.55, 0.70),  # s2  HPC outlet temp
+                (0.40, 0.52),  # s3  LPT outlet temp
+                (0.48, 0.45),  # s4  fan inlet pressure (drops)
+                (0.52, 0.66),  # s5  bypass pressure
+                (0.50, 0.63),  # s6  HPC outlet pressure
+                (0.47, 0.38),  # s7  physical fan speed (drops)
+                (0.53, 0.68),  # s8  physical core speed
+                (0.49, 0.61),  # s9  engine pressure ratio
+                (0.51, 0.64),  # s10 HPC static pressure
+                (0.46, 0.40),  # s11 fuel flow ratio (drops)
+                (0.50, 0.65),  # s12 corrected fan speed
+                (0.52, 0.67),  # s13 corrected core speed
+                (0.48, 0.60),  # s14 bypass ratio
+                (0.50, 0.63),  # s15 burner fuel-air ratio
+                (0.47, 0.58),  # s16 bleed enthalpy
+                (0.49, 0.39),  # s17 demanded fan speed (drops)
+                (0.51, 0.64),  # s18 demanded corrected fan speed
+                (0.48, 0.59),  # s19 HPT coolant bleed
+                (0.50, 0.62),  # s20 LPT coolant bleed
+                (0.46, 0.57),  # s21 (aux)
+                (0.49, 0.60),  # s22 (aux)
+                (0.50, 0.61),  # s23 (aux)
+            ]
 
-                # Build a 30-timestep sequence showing recent degradation trend.
-                # Each timestep nudges wear slightly so the LSTM sees a trajectory,
-                # not a flat line. Live altitude/velocity perturb the first 2 sensors
-                # so current flight conditions still influence the prediction.
-                seq = np.zeros((30, 24))
-                rng = np.random.default_rng(int(fleet_cycles))   # deterministic per aircraft
-                for t in range(30):
-                    # wear increases very slightly across the 30-step window
-                    w = wear_fraction * (0.97 + 0.03 * t / 29)
-                    for s, (healthy, failure) in enumerate(CMAPSS_PROFILE):
-                        val = healthy + (failure - healthy) * w
-                        val += rng.normal(0, 0.004)   # small sensor noise
-                        seq[t, s] = val
-                    # live flight conditions modulate first two channels
-                    seq[t, 0] += (alt - 9000) / 60000
-                    seq[t, 1] += (speed - 220) / 2000
+            # Build a 30-timestep sequence showing recent degradation trend.
+            # Each timestep nudges wear slightly so the LSTM sees a trajectory,
+            # not a flat line. Live altitude/velocity perturb the first 2 sensors
+            # so current flight conditions still influence the prediction.
+            seq = np.zeros((30, 24))
+            rng = np.random.default_rng(int(fleet_cycles))   # deterministic per aircraft
+            for t in range(30):
+                # wear increases very slightly across the 30-step window
+                w = wear_fraction * (0.97 + 0.03 * t / 29)
+                for s, (healthy, failure) in enumerate(CMAPSS_PROFILE):
+                    val = healthy + (failure - healthy) * w
+                    val += rng.normal(0, 0.004)   # small sensor noise
+                    seq[t, s] = val
+                # live flight conditions modulate first two channels
+                seq[t, 0] += (alt - 9000) / 60000
+                seq[t, 1] += (speed - 220) / 2000
 
-                scaled = lstm_scaler.transform(seq)
-                predicted_rul = float(
-                    lstm_model.predict(scaled.reshape(1, 30, 24), verbose=0)[0][0]
-                )
-                predicted_rul = max(5.0, min(200.0, predicted_rul))
-                print(f"🎯 PAK LSTM [{tail_number}]: RUL={predicted_rul:.1f} "
-                      f"cycles={fleet_cycles:.0f} wear={wear_fraction:.2f}")
+            scaled = lstm_scaler.transform(seq)
+            predicted_rul = float(
+                lstm_model.predict(scaled.reshape(1, 30, 24), verbose=0)[0][0]
+            )
+            predicted_rul = max(5.0, min(200.0, predicted_rul))
+            print(f"🎯 PAK LSTM [{tail_number}]: RUL={predicted_rul:.1f} "
+                  f"cycles={fleet_cycles:.0f} wear={wear_fraction:.2f}")
 
-            except Exception as e:
-                print(f"⚠️ LSTM failed for {tail_number}: {e}")
+        except Exception as e:
+            print(f"⚠️ LSTM failed for {tail_number}: {e}")
 
     # ── Risk ──
     if predicted_rul < 20 or anomaly_flag == 1:
@@ -1335,7 +1337,9 @@ def analyze_pakistan_aircraft(tail_number: str):
     temp_c    = wx["temp_c"]
     wx_source = wx["source"]
 
-    health_score = round(min(100, max(0, predicted_rul / 2)), 1)
+    # Map RUL to a 0-100 health scale. 5/123 are the empirical floor/ceiling
+    # from diagnose_lstm.py (z-score cliff), so the newest aircraft show green 80+.
+    health_score = round(min(100, max(0, (predicted_rul - 5) / (123 - 5) * 100)), 1)
     shap_values  = compute_dynamic_shap(alt, speed, if_score, predicted_rul)
 
     # ── Maintenance override: if maintained within 72 hours → reset health ──
