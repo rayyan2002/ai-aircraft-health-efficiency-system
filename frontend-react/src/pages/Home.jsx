@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getPakFleet, getFleetStatus, getWeather } from '../api'
+import { getPakFleet, analyzePak, getFleetStatus, getWeather, AIRLINE_ALIAS } from '../api'
 
 const Card = ({ children, style = {}, onClick, onMouseEnter, onMouseLeave }) => (
   <div onClick={onClick} onMouseEnter={onMouseEnter} onMouseLeave={onMouseLeave}
@@ -15,49 +15,78 @@ const Label = ({ children }) => (
   </div>
 )
 
+// Canonical airline buckets. We match DB values via AIRLINE_ALIAS so both
+// "PIA" and "Pakistan International Airlines" map to the same bucket.
+const AIRLINE_KEYS = ['PIA', 'AirBlue', 'AirSial', 'FlyJinnah']
+
 export default function Home() {
   const navigate = useNavigate()
-  const [fleet,   setFleet]   = useState([])
-  const [status,  setStatus]  = useState({})
+  const [fleet, setFleet]     = useState([])
+  const [health, setHealth]   = useState({})   // tail -> health_score (real, from pak_analyze)
+  const [status, setStatus]   = useState({})
   const [weather, setWeather] = useState([])
   const [loading, setLoading] = useState(true)
-  const [time,    setTime]    = useState(new Date())
+  const [scanPct, setScanPct] = useState(0)
+  const [time, setTime]       = useState(new Date())
 
+  // Load fleet + status + weather first (fast)
   useEffect(() => {
-    const load = async () => {
-      try {
-        const [f, s, w] = await Promise.all([getPakFleet(), getFleetStatus(), getWeather()])
-        setFleet(f.data.fleet     || [])
-        setStatus(s.data          || {})
+    Promise.all([getPakFleet(), getFleetStatus(), getWeather()])
+      .then(([f, s, w]) => {
+        setFleet(f.data.fleet || [])
+        setStatus(s.data || {})
         setWeather(w.data.weather || [])
-      } catch (e) { console.error(e) }
-      finally { setLoading(false) }
-    }
-    load()
-    const iv1 = setInterval(load,  30000)
-    const iv2 = setInterval(() => setTime(new Date()), 1000)
-    return () => { clearInterval(iv1); clearInterval(iv2) }
+      })
+      .catch(e => console.error(e))
+      .finally(() => setLoading(false))
+    const clock = setInterval(() => setTime(new Date()), 1000)
+    return () => clearInterval(clock)
   }, [])
 
-  const healthScores = fleet.map(p => p.health_score || 50).filter(Boolean)
-  const fleetHealth  = healthScores.length
-    ? Math.round(healthScores.reduce((a, b) => a + b, 0) / healthScores.length)
+  // Then scan each aircraft for its REAL health (background, progressive)
+  useEffect(() => {
+    if (!fleet.length) return
+    let cancelled = false
+    ;(async () => {
+      const acc = {}
+      for (let i = 0; i < fleet.length; i++) {
+        if (cancelled) return
+        try {
+          const r = await analyzePak(fleet[i].tail_number)
+          acc[fleet[i].tail_number] = r.data.health_score
+          setHealth({ ...acc })
+        } catch { /* skip */ }
+        setScanPct(Math.round(((i + 1) / fleet.length) * 100))
+      }
+    })()
+    return () => { cancelled = true }
+  }, [fleet])
+
+  // Helper: real health for a plane if scanned, else null
+  const planeHealth = (tail) => (tail in health ? health[tail] : null)
+
+  const scannedScores = Object.values(health)
+  const fleetHealth = scannedScores.length
+    ? Math.round(scannedScores.reduce((a, b) => a + b, 0) / scannedScores.length)
     : null
+
   const airborne = status.summary?.airborne || 0
   const grounded = status.summary?.grounded || 0
-  const critical = fleet.filter(p => (p.health_score || 100) < 30 || p.risk_level === 'High').length
+  const critical = Object.entries(health).filter(([, h]) => h < 40).length
+
   const healthCol = !fleetHealth ? '#388bfd' : fleetHealth >= 70 ? '#3fb950' : fleetHealth >= 40 ? '#d29922' : '#f85149'
 
-  const AIRLINES = ['Pakistan International Airlines','AirBlue','AirSial','Fly Jinnah']
-  const SHORT    = {'Pakistan International Airlines':'PIA','AirBlue':'AirBlue','AirSial':'AirSial','Fly Jinnah':'FlyJinnah'}
-  const airlineStats = AIRLINES.map(name => {
-    const planes = fleet.filter(p => p.airline === name)
-    const scores = planes.map(p => p.health_score || 50)
-    const avg    = scores.length ? Math.round(scores.reduce((a,b)=>a+b,0)/scores.length) : 50
-    return { name, count: planes.length, avg }
+  // Per-airline stats using REAL scanned health
+  const airlineStats = AIRLINE_KEYS.map(key => {
+    const planes = fleet.filter(p => (AIRLINE_ALIAS[p.airline] || p.airline) === key)
+    const scores = planes.map(p => planeHealth(p.tail_number)).filter(v => v != null)
+    const avg = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null
+    return { key, count: planes.length, avg }
   })
 
   if (loading) return <div style={{ padding: '32px 40px', color: '#7d8590', fontSize: 13 }}>Loading fleet data...</div>
+
+  const scanning = scanPct < 100
 
   return (
     <div style={{ padding: '32px 40px', maxWidth: 1400, margin: '0 auto' }}>
@@ -72,7 +101,9 @@ export default function Home() {
           <div style={{ fontFamily:'Orbitron, monospace', fontSize:20, fontWeight:700, color:'#388bfd' }}>
             {time.toLocaleTimeString('en-PK',{timeZone:'Asia/Karachi',hour12:false})}
           </div>
-          <div style={{ fontSize:11, color:'#7d8590', marginTop:2 }}>PKT — Auto-refresh 30s</div>
+          <div style={{ fontSize:11, color:'#7d8590', marginTop:2 }}>
+            PKT · {scanning ? `Analyzing fleet ${scanPct}%` : 'Live'}
+          </div>
         </div>
       </div>
 
@@ -83,9 +114,13 @@ export default function Home() {
           <div>
             <Label>Fleet Health Index</Label>
             <div style={{ fontFamily:'Orbitron, monospace', fontSize:72, fontWeight:900, color:healthCol, lineHeight:1 }}>
-              {fleetHealth ?? '—'}
+              {fleetHealth ?? '··'}
             </div>
-            <div style={{ fontSize:13, color:'#7d8590', marginTop:8 }}>Weighted average across {fleet.length} aircraft</div>
+            <div style={{ fontSize:13, color:'#7d8590', marginTop:8 }}>
+              {scanning
+                ? `Computing live — ${scannedScores.length}/${fleet.length} aircraft analyzed`
+                : `Weighted average across ${scannedScores.length} aircraft`}
+            </div>
           </div>
           <div style={{ flex:1, minWidth:200 }}>
             <div style={{ display:'flex', justifyContent:'space-between', marginBottom:6, fontSize:11, color:'#7d8590' }}>
@@ -103,7 +138,7 @@ export default function Home() {
               {label:'Total Aircraft', value:fleet.length, color:'#388bfd'},
               {label:'Airborne Now',   value:airborne,     color:'#3fb950'},
               {label:'Grounded',       value:grounded,     color:'#7d8590'},
-              {label:'Critical',       value:critical,     color:critical>0?'#f85149':'#3fb950'},
+              {label:'Critical',       value:scanning ? '··' : critical, color:critical>0?'#f85149':'#3fb950'},
             ].map(({label,value,color})=>(
               <div key={label} style={{ background:'#161b22', borderRadius:8, padding:'10px 14px', border:'1px solid #21262d' }}>
                 <div style={{ fontSize:9, color:'#7d8590', letterSpacing:1, textTransform:'uppercase' }}>{label}</div>
@@ -116,18 +151,18 @@ export default function Home() {
 
       {/* Airline breakdown */}
       <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:16, marginBottom:24 }}>
-        {airlineStats.map(({name,count,avg})=>{
-          const col = avg>=70?'#3fb950':avg>=40?'#d29922':'#f85149'
+        {airlineStats.map(({key,count,avg})=>{
+          const col = avg == null ? '#388bfd' : avg>=70?'#3fb950':avg>=40?'#d29922':'#f85149'
           return (
-            <Card key={name} style={{ cursor:'pointer' }}
-              onClick={()=>navigate('/pakistan')}
+            <Card key={key} style={{ cursor:'pointer' }}
+              onClick={()=>navigate('/pakistan', { state: { airline: key } })}
               onMouseEnter={e=>e.currentTarget.style.borderColor='#388bfd'}
               onMouseLeave={e=>e.currentTarget.style.borderColor='#21262d'}>
-              <div style={{ fontSize:11, color:'#7d8590', marginBottom:4 }}>{SHORT[name]}</div>
-              <div style={{ fontFamily:'Orbitron, monospace', fontSize:32, fontWeight:700, color:col }}>{avg}</div>
+              <div style={{ fontSize:11, color:'#7d8590', marginBottom:4 }}>{key}</div>
+              <div style={{ fontFamily:'Orbitron, monospace', fontSize:32, fontWeight:700, color:col }}>{avg ?? '··'}</div>
               <div style={{ fontSize:11, color:'#484f58', marginTop:4 }}>health · {count} aircraft</div>
               <div style={{ marginTop:12, height:4, background:'#21262d', borderRadius:2 }}>
-                <div style={{ height:'100%', width:`${avg}%`, background:col, borderRadius:2 }} />
+                <div style={{ height:'100%', width:`${avg??0}%`, background:col, borderRadius:2, transition:'width 0.6s' }} />
               </div>
             </Card>
           )
@@ -179,14 +214,14 @@ export default function Home() {
       </div>
 
       {/* Critical alert */}
-      {critical>0 && (
+      {!scanning && critical>0 && (
         <Card style={{ borderColor:'#f85149' }}>
           <Label>Critical Aircraft Requiring Attention</Label>
           <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginTop:8 }}>
-            {fleet.filter(p=>(p.health_score||100)<30||p.risk_level==='High').map(p=>(
-              <div key={p.tail_number} onClick={()=>navigate('/maintenance')}
+            {Object.entries(health).filter(([,h])=>h<40).map(([tail])=>(
+              <div key={tail} onClick={()=>navigate('/maintenance')}
                 style={{ background:'rgba(248,81,73,0.1)', border:'1px solid #f85149', borderRadius:8, padding:'8px 16px', cursor:'pointer', fontSize:13, color:'#f85149', fontFamily:'Orbitron, monospace' }}>
-                {p.tail_number}
+                {tail}
               </div>
             ))}
           </div>

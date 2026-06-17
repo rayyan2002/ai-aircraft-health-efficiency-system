@@ -68,18 +68,25 @@ export default function PakistanFleet() {
       setFleet(data)
       const als = [...new Set(data.map(p=>p.airline).filter(Boolean))]
       setAirlines(als)
-      // Use airline from router state if available
+      // Use airline from router state if available. Home passes a canonical key
+      // ('PIA','AirBlue','AirSial','FlyJinnah'); match it against DB values via ALIAS.
       const fromState = location.state?.airline
-      const initial = fromState && als.includes(fromState) ? fromState : als[0]
+      let initial = als[0]
+      if (fromState) {
+        const matched = als.find(a => (ALIAS[a] || a) === fromState || a === fromState)
+        if (matched) initial = matched
+      }
       if (initial) setAirline(initial)
     }).catch(() => setError('Cannot connect to backend. Is uvicorn running?'))
   }, [location.state])
 
+  // When airline changes, clear the aircraft selection so the user chooses one
+  // explicitly (instead of jumping into the first aircraft, which looks unprofessional).
   useEffect(() => {
-    if (!airline || !fleet.length) return
-    const planes = fleet.filter(p => p.airline === airline)
-    if (planes.length) setTail(planes[0].tail_number)
-  }, [airline, fleet])
+    setTail('')
+    setAnalysis(null)
+    setRoute(null)
+  }, [airline])
 
   useEffect(() => {
     if (!tail) return
@@ -148,9 +155,10 @@ export default function PakistanFleet() {
         ))}
         <select value={tail} onChange={e=>setTail(e.target.value)}
           style={{
-            background:'#0d1117', border:'1px solid #21262d', color:'#e6edf3',
-            padding:'6px 14px', borderRadius:8, fontSize:12, cursor:'pointer', minWidth:220,
+            background:'#0d1117', border: tail ? '1px solid #21262d' : '1px solid #388bfd', color: tail ? '#e6edf3' : '#388bfd',
+            padding:'6px 14px', borderRadius:8, fontSize:12, cursor:'pointer', minWidth:240,
           }}>
+          <option value="">— Select an aircraft —</option>
           {planes.map(p => (
             <option key={p.tail_number} value={p.tail_number}>
               {p.tail_number} — {p.aircraft_type?.split('-')[0]||''}
@@ -160,7 +168,24 @@ export default function PakistanFleet() {
         </select>
       </div>
 
+      {/* Prompt when an airline is selected but no aircraft yet */}
+      {!tail && !error && (
+        <div style={{
+          background:'#0d1117', border:'1px dashed #21262d', borderRadius:12,
+          padding:'48px 24px', textAlign:'center', marginTop:8,
+        }}>
+          <div style={{ fontSize:32, marginBottom:12 }}>✈</div>
+          <div style={{ fontFamily:'Orbitron, monospace', fontSize:16, color:'#e6edf3', marginBottom:6 }}>
+            {ALIAS[airline]||airline} selected
+          </div>
+          <div style={{ fontSize:13, color:'#7d8590' }}>
+            Choose an aircraft from the dropdown above to view its digital twin analysis.
+          </div>
+        </div>
+      )}
+
       {/* KPIs */}
+      {tail && (
       <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:12,marginBottom:20}}>
         {[
           {label:'Predicted RUL', value:rul,                          unit:'cycles',  color:'#388bfd'},
@@ -176,6 +201,7 @@ export default function PakistanFleet() {
           </Card>
         ))}
       </div>
+      )}
 
       {/* Maintenance advisory */}
       {analysis && (risk==='High' || health < 30) && (
@@ -192,6 +218,7 @@ export default function PakistanFleet() {
       )}
 
       {/* Map + SHAP */}
+      {tail && (
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginBottom:20}}>
 
         {/* Map */}
@@ -274,6 +301,7 @@ export default function PakistanFleet() {
           </Card>
         </div>
       </div>
+      )}
 
       {/* Emissions strip */}
       {analysis && (
