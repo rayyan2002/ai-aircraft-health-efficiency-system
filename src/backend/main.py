@@ -454,157 +454,128 @@ def reconcile_opensky_fleet_status():
     HEX-BASED FLIGHT LIFECYCLE.
     Links live OpenSky flights to the 44 curated fleet aircraft via the
     icao24 hex code (stored in flight_telemetry.tail_number) matched against
-    fleet.hex_code. Drives the full lifecycle:
+    fleet.hex_code.
 
-      airborne  → OpenSky sees a hex in the last 30 min that matches a fleet
-                  aircraft → mark that tail 'airborne' in fleet_status with
-                  its live callsign.
-      landed    → a tail currently 'airborne' whose hex has NOT been seen in
-                  the last 30 min → write a flight_history row and flip the
-                  tail to 'grounded'.
+      airborne  → a fleet hex seen in the last 30 min → mark that tail
+                  'airborne' in fleet_status with its live callsign.
+      landed    → a tail currently 'airborne' whose hex has NOT been seen
+                  in the last 30 min → write flight_history + flip 'grounded'.
 
-    Returns the number of landings logged this cycle.
+    Returns number of landings logged this cycle.
     """
     landings = 0
     conn = _sqlite3.connect(DB_PATH)
     conn.row_factory = _sqlite3.Row
     try:
-        # ── 1. Build hex → fleet map (once) ──
         fleet_rows = conn.execute(
-            "SELECT tail_number, hex_code, airline FROM fleet WHERE hex_code IS NOT NULL"
+            "SELECT tail_number, hex_code, total_cycles FROM fleet WHERE hex_code IS NOT NULL"
         ).fetchall()
         hex_to_fleet = {
             (r["hex_code"] or "").strip().upper(): {
-                "tail": r["tail_number"], "airline": r["airline"]
+                "tail": r["tail_number"], "cycles": r["total_cycles"],
             }
             for r in fleet_rows if r["hex_code"]
         }
 
-        # ── 2. Which hex codes has OpenSky seen in the last 30 min? ──
-        cutoff = (_datetime.now() - _timedelta(minutes=30)).isoformat()
+        # IMPORTANT: flight_telemetry.timestamp is stored space-separated
+        # ("2026-06-16 19:15:51"); the cutoff MUST use the same format.
+        # .isoformat() would give "...T19:..." and break the text comparison.
+        cutoff = (_datetime.now() - _timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
         live_rows = conn.execute("""
-            SELECT tail_number AS hex, callsign,
-                   MAX(timestamp) AS last_seen,
+            SELECT tail_number AS hex, callsign, MAX(timestamp) AS last_seen,
                    latitude, longitude, altitude, velocity
             FROM flight_telemetry
             WHERE timestamp >= ?
             GROUP BY tail_number
         """, (cutoff,)).fetchall()
 
-        # hex codes currently live AND in our fleet → tail numbers
-        live_fleet_tails = {}   # tail -> {callsign, last_seen, lat, lon}
+        live_fleet_tails = {}
         for r in live_rows:
             hx = (r["hex"] or "").strip().upper()
             if hx in hex_to_fleet:
                 tail = hex_to_fleet[hx]["tail"]
                 live_fleet_tails[tail] = {
-                    "callsign":  r["callsign"],
-                    "last_seen": r["last_seen"],
-                    "lat":       r["latitude"],
-                    "lon":       r["longitude"],
+                    "callsign": r["callsign"], "last_seen": r["last_seen"],
+                    "cycles": hex_to_fleet[hx]["cycles"],
                 }
 
-        # ── 3. Snapshot which fleet tails are currently marked airborne ──
         prev_airborne = set(
             r["tail_number"] for r in conn.execute(
                 "SELECT tail_number FROM fleet_status WHERE status='airborne'"
             ).fetchall()
         )
 
-        # ── 4. Mark live fleet aircraft as airborne (upsert) ──
         for tail, info in live_fleet_tails.items():
             conn.execute("""
                 INSERT INTO fleet_status (tail_number, status, last_seen, current_callsign)
                 VALUES (?, 'airborne', ?, ?)
                 ON CONFLICT(tail_number) DO UPDATE SET
-                    status='airborne',
-                    last_seen=excluded.last_seen,
+                    status='airborne', last_seen=excluded.last_seen,
                     current_callsign=excluded.current_callsign
             """, (tail, info["last_seen"], info["callsign"]))
         conn.commit()
 
-        # ── 5. Landing detection: airborne before, not live now → landed ──
         just_landed = prev_airborne - set(live_fleet_tails.keys())
         for tail in just_landed:
-            # Pull last known telemetry for this aircraft from pakistan_telemetry
-            last = conn.execute("""
-                SELECT altitude, velocity, callsign
-                FROM pakistan_telemetry
-                WHERE tail_number = ?
-                ORDER BY id DESC LIMIT 1
-            """, (tail,)).fetchone()
-
-            # also try the current_callsign we stored on fleet_status
             fs = conn.execute(
-                "SELECT current_callsign FROM fleet_status WHERE tail_number=?",
-                (tail,)
+                "SELECT current_callsign FROM fleet_status WHERE tail_number=?", (tail,)
             ).fetchone()
-            callsign = (fs["current_callsign"] if fs and fs["current_callsign"]
-                        else (last["callsign"] if last and last["callsign"] else tail))
+            callsign = fs["current_callsign"] if fs and fs["current_callsign"] else tail
 
-            alt_last = (last["altitude"] if last and last["altitude"] else 9000.0)
-            vel_last = (last["velocity"] if last and last["velocity"] else 220.0)
+            frow = conn.execute(
+                "SELECT total_cycles FROM fleet WHERE tail_number=?", (tail,)
+            ).fetchone()
+            cycles = float(frow["total_cycles"]) if frow and frow["total_cycles"] else 15000.0
 
+            alt_last, vel_last = 9000.0, 220.0
             fuel = round(compute_fuel_burn(alt_last, vel_last, 30), 1)
             co2  = round(fuel * 2.53, 1)
 
-            # health via the SAME cycle-based degradation mapping used by pak_analyze
             final_health = 50.0
             try:
-                frow = conn.execute(
-                    "SELECT total_cycles FROM fleet WHERE tail_number=?", (tail,)
-                ).fetchone()
-                cycles = float(frow["total_cycles"]) if frow and frow["total_cycles"] else 15000.0
                 if lstm_model and lstm_scaler:
                     rul = _predict_rul_from_cycles(cycles, alt_last, vel_last)
                     final_health = round(min(100, max(0, (rul - 5) / (123 - 5) * 100)), 1)
             except Exception as e:
                 print(f"   ⚠️ landing health calc failed for {tail}: {e}")
 
-            # Write flight_history row
             try:
                 db2 = SessionLocal()
                 db2.add(models_db.FlightHistory(
-                    tail_number        = tail,
-                    origin             = "KHI",
-                    destination        = "Unknown",
-                    total_fuel_liters  = fuel,
-                    co2_kg             = co2,
-                    final_health_score = final_health,
+                    tail_number=tail, origin="KHI", destination="Unknown",
+                    total_fuel_liters=fuel, co2_kg=co2, final_health_score=final_health,
                 ))
-                db2.commit()
-                db2.close()
+                db2.commit(); db2.close()
             except Exception as e:
                 print(f"   ⚠️ flight_history insert failed for {tail}: {e}")
 
-            # Flip to grounded
             conn.execute("""
-                UPDATE fleet_status
-                SET status='grounded', last_seen=?, current_callsign=NULL
+                UPDATE fleet_status SET status='grounded', last_seen=?, current_callsign=NULL
                 WHERE tail_number=?
-            """, (_datetime.now().isoformat(), tail))
+            """, (_datetime.now().strftime("%Y-%m-%d %H:%M:%S"), tail))
             conn.commit()
             landings += 1
             print(f"   🛬 {tail} ({callsign}) landed → flight_history "
                   f"| fuel={fuel}L health={final_health}")
 
         if live_fleet_tails:
-            summary = ", ".join(
-                f"{t}({i['callsign']})" for t, i in live_fleet_tails.items()
-            )
-            print(f"   ✈️  Airborne fleet aircraft: {summary}")
+            summary = ", ".join(f"{t}({i['callsign']})" for t, i in live_fleet_tails.items())
+            print(f"   ✈️  Airborne fleet aircraft ({len(live_fleet_tails)}): {summary}")
+        else:
+            print("   ℹ️  No fleet aircraft airborne in last 30 min "
+                  "(no live OpenSky hex matched the 44 fleet aircraft).")
     except Exception as e:
         print(f"⚠️ reconcile_opensky_fleet_status error: {e}")
     finally:
         conn.close()
-
     return landings
 
 
 def _predict_rul_from_cycles(fleet_cycles, alt, speed):
     """
-    Shared helper: predict RUL from accumulated engine cycles using the same
-    CMAPSS degradation mapping as /api/pak_analyze. Used by landing detection.
+    Shared helper: predict RUL from accumulated engine cycles using the SAME
+    blend as /api/pak_analyze (LSTM trend + wear anchor). Used by landing
+    detection so flight_history health matches the live page.
     """
     DESIGN_LIFE_CYCLES = 50000
     wear_fraction = min(0.95, fleet_cycles / DESIGN_LIFE_CYCLES)
@@ -614,10 +585,11 @@ def _predict_rul_from_cycles(fleet_cycles, alt, speed):
         (0.50,0.65),(0.52,0.67),(0.48,0.60),(0.50,0.63),(0.47,0.58),(0.49,0.39),
         (0.51,0.64),(0.48,0.59),(0.50,0.62),(0.46,0.57),(0.49,0.60),(0.50,0.61),
     ]
+    WEAR_AMPLIFIER = 3.0
     seq = np.zeros((30, 24))
     rng = np.random.default_rng(int(fleet_cycles))
     for t in range(30):
-        w = wear_fraction * (0.97 + 0.03 * t / 29)
+        w = min(1.0, wear_fraction * WEAR_AMPLIFIER * (0.97 + 0.03 * t / 29))
         for s, (healthy, failure) in enumerate(CMAPSS_PROFILE):
             val = healthy + (failure - healthy) * w
             val += rng.normal(0, 0.004)
@@ -625,8 +597,10 @@ def _predict_rul_from_cycles(fleet_cycles, alt, speed):
         seq[t, 0] += (alt - 9000) / 60000
         seq[t, 1] += (speed - 220) / 2000
     scaled = lstm_scaler.transform(seq)
-    rul = float(lstm_model.predict(scaled.reshape(1, 30, 24), verbose=0)[0][0])
-    return max(5.0, min(200.0, rul))
+    raw_rul = float(lstm_model.predict(scaled.reshape(1, 30, 24), verbose=0)[0][0])
+    wear_rul = 123 - wear_fraction * (123 - 5)
+    rul = 0.3 * raw_rul + 0.7 * wear_rul
+    return max(5.0, min(123.0, rul))
 
 
 async def automated_data_pipeline():
@@ -659,9 +633,6 @@ async def automated_data_pipeline():
                 errors.append(f"opensky:{e}")
 
             # ── Step 2b: HEX-BASED RECONCILIATION (flight lifecycle) ──
-            # Match live OpenSky hex codes → fleet tails → fleet_status,
-            # and detect landings → flight_history. This is what makes the
-            # Home airborne count and Pakistan Fleet flight numbers real.
             try:
                 hex_landings = await asyncio.get_event_loop().run_in_executor(
                     None, reconcile_opensky_fleet_status
@@ -766,10 +737,7 @@ async def automated_data_pipeline():
             conn_fs.close()
 
             # ── Step 6: Legacy auto-lander — DISABLED ──
-            # Superseded by Step 2b hex-based reconciliation, which links live
-            # flights to real fleet tails and logs landings to flight_history
-            # keyed by tail number. The old logic keyed history by hex/callsign
-            # and wrote "Auto-Detect" placeholder rows, so it is no longer used.
+            # Superseded by Step 2b hex-based reconciliation.
             pass
 
         except Exception as e:
@@ -1071,7 +1039,6 @@ def get_live_fleet(db: Session = Depends(get_db)):
             .order_by(func.max(models_db.FlightTelemetry.timestamp).desc())
             .all()
         )
-
         planes = [r[0] for r in rows]
 
         if not planes:
@@ -1231,7 +1198,7 @@ def analyze_aircraft_live(tail_number: str, db: Session = Depends(get_db)):
     co2_kg       = round(fuel_litres * 2.53, 1)
     wind_ms      = compute_wind(speed, alt)
     temp_c       = compute_temp(alt)
-    health_score = round(min(100, max(0, predicted_rul / 2)), 1)
+    health_score = round(min(100, max(0, (predicted_rul - 5) / (123 - 5) * 100)), 1)
     shap_values  = compute_dynamic_shap(alt, speed, if_score, predicted_rul)
 
     return {
@@ -1331,27 +1298,17 @@ def get_pakistan_fleet():
     try:
         rows = conn.execute("""
             SELECT
-                f.tail_number,
-                f.aircraft_type,
-                f.airline,
-                f.hex_code,
-                t.callsign,
-                t.altitude,
-                t.velocity,
-                t.latitude,
-                t.longitude,
-                t.timestamp,
-                fs.status            AS fs_status,
-                fs.current_callsign  AS fs_callsign,
-                fs.last_seen         AS fs_last_seen
+                f.tail_number, f.aircraft_type, f.airline, f.hex_code,
+                t.callsign, t.altitude, t.velocity, t.latitude, t.longitude, t.timestamp,
+                fs.status AS fs_status, fs.current_callsign AS fs_callsign,
+                fs.last_seen AS fs_last_seen
             FROM fleet f
             LEFT JOIN (
                 SELECT tail_number, callsign, altitude, velocity,
                        latitude, longitude, timestamp
                 FROM pakistan_telemetry
                 WHERE id IN (
-                    SELECT MAX(id) FROM pakistan_telemetry
-                    GROUP BY tail_number
+                    SELECT MAX(id) FROM pakistan_telemetry GROUP BY tail_number
                 )
             ) t ON t.tail_number = f.tail_number
             LEFT JOIN fleet_status fs ON fs.tail_number = f.tail_number
@@ -1361,9 +1318,6 @@ def get_pakistan_fleet():
         fleet = []
         for r in rows:
             r = dict(r)
-
-            # Real status comes from fleet_status (hex-reconciled). Fall back to
-            # telemetry-based heuristic only if fleet_status has nothing.
             fs_status = r.get("fs_status")
             if fs_status in ("airborne", "grounded"):
                 status = fs_status
@@ -1372,7 +1326,6 @@ def get_pakistan_fleet():
             else:
                 status = "grounded"
 
-            # Active flight number: prefer the live callsign from reconciliation
             live_callsign = r.get("fs_callsign") or (r.get("callsign") if status == "airborne" else None)
 
             fleet.append({
@@ -1500,11 +1453,17 @@ def analyze_pakistan_aircraft(tail_number: str):
                 # Each timestep nudges wear slightly so the LSTM sees a trajectory,
                 # not a flat line. Live altitude/velocity perturb the first 2 sensors
                 # so current flight conditions still influence the prediction.
+                #
+                # AMPLITUDE NOTE: the healthy→failure deltas in CMAPSS_PROFILE are
+                # small, so we apply a wear amplifier so that a high-cycle aircraft
+                # presents a clearly more-degraded sequence than a low-cycle one.
+                # Without this, all aircraft collapse to a near-identical RUL.
+                WEAR_AMPLIFIER = 3.0
                 seq = np.zeros((30, 24))
                 rng = np.random.default_rng(int(fleet_cycles))   # deterministic per aircraft
                 for t in range(30):
                     # wear increases very slightly across the 30-step window
-                    w = wear_fraction * (0.97 + 0.03 * t / 29)
+                    w = min(1.0, wear_fraction * WEAR_AMPLIFIER * (0.97 + 0.03 * t / 29))
                     for s, (healthy, failure) in enumerate(CMAPSS_PROFILE):
                         val = healthy + (failure - healthy) * w
                         val += rng.normal(0, 0.004)   # small sensor noise
@@ -1514,12 +1473,19 @@ def analyze_pakistan_aircraft(tail_number: str):
                     seq[t, 1] += (speed - 220) / 2000
 
                 scaled = lstm_scaler.transform(seq)
-                predicted_rul = float(
+                raw_rul = float(
                     lstm_model.predict(scaled.reshape(1, 30, 24), verbose=0)[0][0]
                 )
-                predicted_rul = max(5.0, min(200.0, predicted_rul))
+
+                # The LSTM gives the trend; we anchor it to the empirical RUL range
+                # (5–123 cycles) using the wear fraction so the cycle signal is
+                # clearly reflected. Blend keeps the model in the loop while
+                # guaranteeing a meaningful spread between new and old aircraft.
+                wear_rul = 123 - wear_fraction * (123 - 5)   # 0 wear→123, full wear→5
+                predicted_rul = 0.3 * raw_rul + 0.7 * wear_rul
+                predicted_rul = max(5.0, min(123.0, predicted_rul))
                 print(f"🎯 PAK LSTM [{tail_number}]: RUL={predicted_rul:.1f} "
-                      f"cycles={fleet_cycles:.0f} wear={wear_fraction:.2f}")
+                      f"cycles={fleet_cycles:.0f} wear={wear_fraction:.2f} raw={raw_rul:.1f}")
 
             except Exception as e:
                 print(f"⚠️ LSTM failed for {tail_number}: {e}")
@@ -1541,7 +1507,7 @@ def analyze_pakistan_aircraft(tail_number: str):
     temp_c    = wx["temp_c"]
     wx_source = wx["source"]
 
-    health_score = round(min(100, max(0, predicted_rul / 2)), 1)
+    health_score = round(min(100, max(0, (predicted_rul - 5) / (123 - 5) * 100)), 1)
     shap_values  = compute_dynamic_shap(alt, speed, if_score, predicted_rul)
 
     # ── Maintenance override: if maintained within 72 hours → reset health ──
