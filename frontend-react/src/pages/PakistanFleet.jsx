@@ -68,25 +68,34 @@ export default function PakistanFleet() {
       setFleet(data)
       const als = [...new Set(data.map(p=>p.airline).filter(Boolean))]
       setAirlines(als)
-      // Use airline from router state if available. Home passes a canonical key
-      // ('PIA','AirBlue','AirSial','FlyJinnah'); match it against DB values via ALIAS.
+      // Airline from router state. Home passes a canonical key
+      // ('PIA','AirBlue','AirSial','FlyJinnah'); match against DB values via ALIAS.
       const fromState = location.state?.airline
       let initial = als[0]
       if (fromState) {
         const matched = als.find(a => (ALIAS[a] || a) === fromState || a === fromState)
         if (matched) initial = matched
       }
+
+      // If a specific aircraft was requested (e.g. clicking an airborne card on
+      // Home), open it directly instead of making the user pick again.
+      const wantTail = location.state?.tail
+      const plane = wantTail && data.find(p => p.tail_number === wantTail)
+      if (plane) {
+        initial = plane.airline           // make sure the airline matches the aircraft
+        setAirline(initial)
+        setTail(plane.tail_number)        // auto-select it
+        return
+      }
+
       if (initial) setAirline(initial)
     }).catch(() => setError('Cannot connect to backend. Is uvicorn running?'))
   }, [location.state])
 
-  // When airline changes, clear the aircraft selection so the user chooses one
-  // explicitly (instead of jumping into the first aircraft, which looks unprofessional).
-  useEffect(() => {
-    setTail('')
-    setAnalysis(null)
-    setRoute(null)
-  }, [airline])
+  // NOTE: clearing the aircraft when the airline changes is handled directly in
+  // the airline button's onClick, not in an effect. Doing it in an effect would
+  // also fire when the airline is set programmatically (e.g. when Home asks for
+  // a specific aircraft), wiping the very aircraft we were told to open.
 
   useEffect(() => {
     if (!tail) return
@@ -105,6 +114,9 @@ export default function PakistanFleet() {
   }, [tail])
 
   const planes   = fleet.filter(p => p.airline === airline)
+  const selPlane = fleet.find(p => p.tail_number === tail) || {}
+  const isAirborne = selPlane.status === 'airborne'
+  const flightNo = selPlane.current_flight || selPlane.callsign
   const lt       = analysis?.live_telemetry || {}
   const lat      = lt.lat  || 30.3753
   const lon      = lt.lon  || 69.3451
@@ -123,11 +135,36 @@ export default function PakistanFleet() {
         <div style={{fontSize:10,color:'#484f58',letterSpacing:3,textTransform:'uppercase',marginBottom:4}}>
           Pakistan Fleet — Digital Twin
         </div>
-        <div style={{display:'flex',alignItems:'baseline',gap:12}}>
+        <div style={{display:'flex',alignItems:'center',gap:12,flexWrap:'wrap'}}>
           <div style={{fontFamily:'Orbitron, monospace',fontSize:26,fontWeight:900,color:'#e6edf3'}}>{tail||'—'}</div>
           {analysis && (
             <span style={{fontSize:13,color:'#7d8590'}}>
               {analysis.aircraft_type} · {ALIAS[analysis.airline]||analysis.airline}
+            </span>
+          )}
+          {tail && (
+            <span style={{
+              fontSize:11, padding:'3px 10px', borderRadius:20, fontWeight:600,
+              display:'inline-flex', alignItems:'center', gap:5,
+              background: isAirborne ? 'rgba(63,185,80,0.12)' : 'rgba(125,133,144,0.12)',
+              color: isAirborne ? '#3fb950' : '#7d8590',
+              border: `1px solid ${isAirborne ? '#3fb95055' : '#7d859033'}`,
+            }}>
+              <span style={{
+                width:6, height:6, borderRadius:'50%',
+                background: isAirborne ? '#3fb950' : '#7d8590',
+                boxShadow: isAirborne ? '0 0 6px #3fb950' : 'none',
+              }}/>
+              {isAirborne ? 'AIRBORNE' : 'GROUNDED'}
+            </span>
+          )}
+          {tail && isAirborne && flightNo && (
+            <span style={{
+              fontSize:12, padding:'3px 10px', borderRadius:20,
+              background:'rgba(56,139,253,0.12)', color:'#388bfd',
+              border:'1px solid #388bfd55', fontFamily:'Orbitron, monospace', fontWeight:600,
+            }}>
+              ✈ {toIATA(flightNo)}
             </span>
           )}
           {loading && <span style={{fontSize:12,color:'#388bfd',marginLeft:8}}>Loading...</span>}
@@ -143,7 +180,7 @@ export default function PakistanFleet() {
       {/* Airline + aircraft selectors */}
       <div style={{display:'flex',gap:10,marginBottom:20,flexWrap:'wrap',alignItems:'center'}}>
         {airlines.map(a => (
-          <button key={a} onClick={()=>setAirline(a)}
+          <button key={a} onClick={()=>{ setAirline(a); setTail(''); setAnalysis(null); setRoute(null) }}
             style={{
               padding:'6px 16px', borderRadius:20, fontSize:12, cursor:'pointer',
               border: airline===a ? '1px solid #388bfd' : '1px solid #21262d',
@@ -162,7 +199,9 @@ export default function PakistanFleet() {
           {planes.map(p => (
             <option key={p.tail_number} value={p.tail_number}>
               {p.tail_number} — {p.aircraft_type?.split('-')[0]||''}
-              {p.status==='airborne' ? ' ✈' : ' 🅿'}
+              {p.status==='airborne'
+                ? ` ✈ ${toIATA(p.current_flight||p.callsign||'')}`
+                : ' 🅿'}
             </option>
           ))}
         </select>

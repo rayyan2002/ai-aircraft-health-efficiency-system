@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useLocation } from 'react-router-dom'
 import { getPakFleet, analyzePak, getMaintHistory, logMaintenance, shortAirline, healthColor, riskColor, AIRLINE_ALIAS } from '../api'
 import { Page, Card, Label, Pill, Badge, Bar, Empty, Spinner, C } from '../components/ui'
 
@@ -22,13 +23,24 @@ export default function Maintenance() {
   const [submitting, setSubmitting] = useState(false)
   const [toast, setToast]         = useState('')
 
+  const location_router = useLocation()
+
   useEffect(() => {
     getPakFleet().then(r => {
       const data = r.data.fleet || []
       setFleet(data)
-      if (data.length) setTail(data[0].tail_number)
+      // If Home (or another page) navigated here with a specific aircraft,
+      // open that one. Otherwise fall back to the first in the list.
+      const wanted = location_router.state?.tail
+      const match = wanted && data.find(p => p.tail_number === wanted)
+      if (match) {
+        setTail(match.tail_number)
+        setFilter(AIRLINE_ALIAS[match.airline] || match.airline || 'All')
+      } else if (data.length) {
+        setTail(data[0].tail_number)
+      }
     }).finally(() => setLoading(false))
-  }, [])
+  }, [location_router.state])
 
   const loadAircraft = (t) => {
     if (!t) return

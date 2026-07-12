@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getPakFleet, analyzePak, getFleetStatus, getWeather, AIRLINE_ALIAS } from '../api'
+import { getPakFleet, analyzePak, getFleetStatus, getWeather, AIRLINE_ALIAS, toIATA } from '../api'
 
 const Card = ({ children, style = {}, onClick, onMouseEnter, onMouseLeave }) => (
   <div onClick={onClick} onMouseEnter={onMouseEnter} onMouseLeave={onMouseLeave}
@@ -149,6 +149,53 @@ export default function Home() {
         </div>
       </Card>
 
+      {/* Airborne right now — which aircraft, which flight */}
+      {airborne > 0 && (
+        <Card style={{ marginBottom:24, borderColor:'#3fb950' }}>
+          <Label>Airborne Now</Label>
+          <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(280px,1fr))', gap:10, marginTop:8 }}>
+            {(status.aircraft || [])
+              .filter(a => a.status === 'airborne')
+              .map(a => (
+                <div key={a.tail_number}
+                  onClick={()=>navigate('/pakistan', { state: { airline: AIRLINE_ALIAS[a.airline] || a.airline, tail: a.tail_number } })}
+                  style={{
+                    background:'rgba(63,185,80,0.06)', border:'1px solid rgba(63,185,80,0.35)',
+                    borderRadius:8, padding:'12px 14px', cursor:'pointer'
+                  }}
+                  onMouseEnter={e=>e.currentTarget.style.borderColor='#3fb950'}
+                  onMouseLeave={e=>e.currentTarget.style.borderColor='rgba(63,185,80,0.35)'}>
+                  <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
+                    <span style={{ fontFamily:'Orbitron, monospace', fontSize:14, fontWeight:700, color:'#e6edf3' }}>
+                      {a.tail_number}
+                    </span>
+                    <span style={{
+                      fontFamily:'Orbitron, monospace', fontSize:12, fontWeight:600, color:'#3fb950',
+                      background:'rgba(63,185,80,0.12)', border:'1px solid #3fb95055',
+                      borderRadius:20, padding:'2px 10px'
+                    }}>
+                      ✈ {toIATA(a.callsign || '')}
+                    </span>
+                  </div>
+                  <div style={{ fontSize:11, color:'#7d8590', marginBottom:6 }}>
+                    {a.aircraft_type} · {AIRLINE_ALIAS[a.airline] || a.airline}
+                  </div>
+                  <div style={{ display:'flex', alignItems:'center', gap:8, fontSize:12 }}>
+                    <span style={{ fontFamily:'Orbitron, monospace', color:'#388bfd' }}>{a.departure || '—'}</span>
+                    <span style={{ color:'#484f58', flex:1, textAlign:'center', letterSpacing:2 }}>····▸</span>
+                    <span style={{ fontFamily:'Orbitron, monospace', color:'#388bfd' }}>{a.arrival || '—'}</span>
+                  </div>
+                  {(!a.departure && !a.arrival) && (
+                    <div style={{ fontSize:10, color:'#484f58', marginTop:5 }}>
+                      Route not broadcast on ADS-B — requires a flight-schedule data source
+                    </div>
+                  )}
+                </div>
+              ))}
+          </div>
+        </Card>
+      )}
+
       {/* Airline breakdown */}
       <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:16, marginBottom:24 }}>
         {airlineStats.map(({key,count,avg})=>{
@@ -219,7 +266,7 @@ export default function Home() {
           <Label>Critical Aircraft Requiring Attention</Label>
           <div style={{ display:'flex', gap:10, flexWrap:'wrap', marginTop:8 }}>
             {Object.entries(health).filter(([,h])=>h<40).map(([tail])=>(
-              <div key={tail} onClick={()=>navigate('/maintenance')}
+              <div key={tail} onClick={()=>navigate('/maintenance', { state: { tail } })}
                 style={{ background:'rgba(248,81,73,0.1)', border:'1px solid #f85149', borderRadius:8, padding:'8px 16px', cursor:'pointer', fontSize:13, color:'#f85149', fontFamily:'Orbitron, monospace' }}>
                 {tail}
               </div>

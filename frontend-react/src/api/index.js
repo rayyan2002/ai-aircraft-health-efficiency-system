@@ -6,6 +6,8 @@ const api = axios.create({ baseURL: '/api', timeout: 20000 })
 export const getLiveFleet    = ()      => api.get('/live_fleet')
 export const analyzeLive     = (tail)  => api.get(`/analyze/${tail}`)
 export const getLiveRoute    = (tail)  => api.get(`/route/${tail}`)
+export const getLiveMap      = ()      => api.get('/live_map')
+export const getLiveTrack    = (cs)    => api.get(`/live_track/${cs}`)
 export const getHistory      = (tail)  => api.get(`/history/${tail}`)
 
 // ── Pakistan Fleet ──
