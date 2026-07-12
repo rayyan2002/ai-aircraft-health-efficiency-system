@@ -38,6 +38,28 @@ from datetime import datetime as _datetime
 
 DB_PATH = os.path.join(BASE_DIR, "..", "backend", "aviation_data.db")
 
+
+def _migrate_flight_telemetry():
+    """
+    Add track (heading) and vertical_rate columns if they don't exist.
+    Safe to run on every startup — SQLite has no 'ADD COLUMN IF NOT EXISTS',
+    so we check pragma first. Existing rows get NULL, which the map handles.
+    """
+    try:
+        conn = _sqlite3.connect(DB_PATH)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(flight_telemetry)")}
+        for col, decl in (("track", "FLOAT"), ("vertical_rate", "FLOAT")):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE flight_telemetry ADD COLUMN {col} {decl}")
+                print(f"🛠  [migration] added flight_telemetry.{col}")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️  [migration] flight_telemetry: {e}")
+
+
+_migrate_flight_telemetry()
+
 # ── Create fleet_status + pipeline_log tables on startup ──
 def _init_extra_tables():
     conn = _sqlite3.connect(DB_PATH)
@@ -123,7 +145,15 @@ def fetch_and_insert_opensky():
 
         saved = 0
         limit = 100
-        PAK_PREFIXES = ("PIA", "ABQ", "ERD", "NL", "SAI", "ORM")
+        # ICAO callsign prefixes for Pakistani carriers.
+        #   PIA = Pakistan International Airlines
+        #   ABQ = airblue
+        #   SIF = AirSial          (was MISSING — its flights were being dropped)
+        #   FJL = Fly Jinnah       (was MISSING — its flights were being dropped)
+        #   ERD = SereneAir
+        # NOTE: do not add prefixes shorter than 3 characters — a 2-char prefix
+        # matches unrelated foreign callsigns and pollutes the feed.
+        PAK_PREFIXES = ("PIA", "ABQ", "SIF", "FJL", "ERD")
 
         for flight in states:
             if saved >= limit:
@@ -135,21 +165,35 @@ def fetch_and_insert_opensky():
             lat      = flight[6]
             alt      = flight[7]
             vel      = flight[9]
+            track    = flight[10]   # true_track: heading in degrees (0=north)
+            vrate    = flight[11]   # vertical rate m/s (+climb, -descent)
 
             if None in (lat, lon, alt, vel):
                 continue
             if alt <= 0:
                 continue
 
-            if not any(callsign.startswith(p) for p in PAK_PREFIXES):
+            # We now capture EVERY aircraft inside the Pakistan bounding box,
+            # not just Pakistani carriers. Foreign traffic is real, visible in
+            # Pakistani airspace, and worth monitoring for anomalies.
+            #
+            # IMPORTANT LIMITATION: ADS-B does NOT broadcast origin or
+            # destination. So we can say "this aircraft is in Pakistani
+            # airspace" but we CANNOT say whether it is landing in Pakistan or
+            # merely overflying. Claiming arrival/departure would require a
+            # flight-schedule API. The UI must not overstate this.
+            #
+            # PAK_PREFIXES is kept only to LABEL carriers, never to drop them.
+            if callsign == "UNKNOWN":
                 continue
 
             cursor.execute("""
                 INSERT INTO flight_telemetry
                 (tail_number, callsign, altitude, velocity,
-                 latitude, longitude, anomaly_flag, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, 0, ?)
-            """, (icao24, callsign, alt, vel, lat, lon, _datetime.now()))
+                 latitude, longitude, track, vertical_rate, anomaly_flag, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """, (icao24, callsign, alt, vel, lat, lon,
+                  track, vrate, _datetime.now()))
             saved += 1
 
         conn.commit()
@@ -449,6 +493,16 @@ def _get_row_count(table: str) -> int:
         return 0
 
 
+def _fresh_cutoff(minutes: int = 30) -> str:
+    """
+    Shared recency cutoff for 'is this aircraft really airborne right now?'.
+    Returns a space-separated timestamp string matching how SQLite stores them
+    (never use .isoformat() here — the 'T' separator breaks text comparison).
+    Every status-reporting endpoint uses this so all pages agree on the count.
+    """
+    return (_datetime.now() - _timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def reconcile_opensky_fleet_status():
     """
     HEX-BASED FLIGHT LIFECYCLE.
@@ -515,7 +569,20 @@ def reconcile_opensky_fleet_status():
             """, (tail, info["last_seen"], info["callsign"]))
         conn.commit()
 
-        just_landed = prev_airborne - set(live_fleet_tails.keys())
+        # Landing / staleness detection.
+        # An aircraft counts as landed if it is currently marked 'airborne' but
+        # its hex has NOT been seen in the recency window. We take this from the
+        # DB directly (not just prev_airborne) so that rows left 'airborne' by an
+        # earlier session or a missed cycle are self-healed rather than sticking
+        # forever — this is what caused airborne counts to drift across pages.
+        stale_airborne = set(
+            r["tail_number"] for r in conn.execute("""
+                SELECT tail_number FROM fleet_status
+                WHERE status = 'airborne'
+                  AND (last_seen IS NULL OR last_seen < ?)
+            """, (cutoff,)).fetchall()
+        )
+        just_landed = (prev_airborne | stale_airborne) - set(live_fleet_tails.keys())
         for tail in just_landed:
             fs = conn.execute(
                 "SELECT current_callsign FROM fleet_status WHERE tail_number=?", (tail,)
@@ -1018,6 +1085,111 @@ def get_fleet_data(db: Session = Depends(get_db)):
         return {"fleet": [{"tail_number": "Error", "current_flight": str(e)}]}
 
 
+@app.get("/api/live_map")
+def get_live_map():
+    """
+    All aircraft currently in Pakistani airspace, with position and heading,
+    for the map view. One call instead of one per aircraft.
+
+    NOTE: origin/destination are NOT included because ADS-B does not broadcast
+    route information. Do not add them until a flight-schedule API is wired in.
+    """
+    conn = get_raw_conn()
+    try:
+        cutoff = _fresh_cutoff(30)
+
+        # Latest row per aircraft in the window
+        rows = conn.execute("""
+            SELECT ft.tail_number AS hex, ft.callsign, ft.latitude, ft.longitude,
+                   ft.altitude, ft.velocity, ft.track, ft.vertical_rate,
+                   ft.timestamp, ft.anomaly_flag
+            FROM flight_telemetry ft
+            INNER JOIN (
+                SELECT tail_number, MAX(timestamp) AS mx
+                FROM flight_telemetry
+                WHERE timestamp >= ?
+                GROUP BY tail_number
+            ) latest
+              ON latest.tail_number = ft.tail_number
+             AND latest.mx = ft.timestamp
+            WHERE ft.latitude IS NOT NULL AND ft.longitude IS NOT NULL
+        """, (cutoff,)).fetchall()
+
+        # hex -> fleet tail, so we can highlight our own aircraft
+        fleet_map = {
+            (r["hex_code"] or "").strip().upper(): {
+                "tail": r["tail_number"], "airline": r["airline"],
+                "type": r["aircraft_type"],
+            }
+            for r in conn.execute(
+                "SELECT tail_number, hex_code, airline, aircraft_type "
+                "FROM fleet WHERE hex_code IS NOT NULL"
+            ).fetchall()
+        }
+
+        CARRIERS = {"PIA": "PIA", "ABQ": "AirBlue", "SIF": "AirSial",
+                    "FJL": "FlyJinnah", "ERD": "SereneAir"}
+
+        aircraft = []
+        for r in rows:
+            hx = (r["hex"] or "").strip().upper()
+            cs = (r["callsign"] or "").strip()
+            fleet_hit = fleet_map.get(hx)
+
+            operator = None
+            for pfx, name in CARRIERS.items():
+                if cs.startswith(pfx):
+                    operator = name
+                    break
+
+            aircraft.append({
+                "hex":           hx,
+                "callsign":      cs,
+                "lat":           r["latitude"],
+                "lon":           r["longitude"],
+                "altitude":      r["altitude"],
+                "velocity":      r["velocity"],
+                "track":         r["track"],           # may be None on old rows
+                "vertical_rate": r["vertical_rate"],
+                "anomaly":       bool(r["anomaly_flag"]),
+                "in_fleet":      bool(fleet_hit),
+                "tail_number":   fleet_hit["tail"] if fleet_hit else None,
+                "airline":       fleet_hit["airline"] if fleet_hit else operator,
+                "aircraft_type": fleet_hit["type"] if fleet_hit else None,
+                "is_pakistani":  operator is not None,
+                "last_seen":     r["timestamp"],
+            })
+
+        return {
+            "aircraft":   aircraft,
+            "total":      len(aircraft),
+            "fleet":      sum(1 for a in aircraft if a["in_fleet"]),
+            "pakistani":  sum(1 for a in aircraft if a["is_pakistani"]),
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/live_track/{callsign}")
+def get_live_track(callsign: str):
+    """Recent position history for one aircraft — the trail behind it."""
+    conn = get_raw_conn()
+    try:
+        rows = conn.execute("""
+            SELECT latitude, longitude, altitude, timestamp
+            FROM flight_telemetry
+            WHERE callsign = ?
+              AND latitude IS NOT NULL AND longitude IS NOT NULL
+            ORDER BY timestamp DESC
+            LIMIT 60
+        """, (callsign.upper(),)).fetchall()
+        pts = [{"lat": r["latitude"], "lon": r["longitude"],
+                "alt": r["altitude"], "t": r["timestamp"]} for r in reversed(rows)]
+        return {"callsign": callsign.upper(), "points": pts, "count": len(pts)}
+    finally:
+        conn.close()
+
+
 @app.get("/api/live_fleet")
 def get_live_fleet(db: Session = Depends(get_db)):
     """
@@ -1044,8 +1216,39 @@ def get_live_fleet(db: Session = Depends(get_db)):
         if not planes:
             return {"fleet": [{"tail_number": "No live flights", "current_flight": "—"}]}
 
+        # Label each callsign: is it a Pakistani carrier, or foreign traffic in
+        # Pakistani airspace? We can classify the OPERATOR from the callsign
+        # prefix, but we deliberately do NOT claim origin/destination — ADS-B
+        # does not broadcast route information.
+        CARRIERS = {
+            "PIA": "Pakistan International Airlines",
+            "ABQ": "airblue",
+            "SIF": "AirSial",
+            "FJL": "Fly Jinnah",
+            "ERD": "SereneAir",
+        }
+
+        out = []
+        for p in planes:
+            operator, is_pak = None, False
+            for prefix, name in CARRIERS.items():
+                if p.startswith(prefix):
+                    operator, is_pak = name, True
+                    break
+            out.append({
+                "tail_number":    p,
+                "current_flight": p,
+                "operator":       operator or "Foreign / other operator",
+                "is_pakistani":   is_pak,
+            })
+
+        # Pakistani carriers first, then foreign traffic
+        out.sort(key=lambda x: (not x["is_pakistani"], x["tail_number"]))
+
         return {
-            "fleet": [{"tail_number": p, "current_flight": p} for p in planes]
+            "fleet": out,
+            "pakistani_count": sum(1 for x in out if x["is_pakistani"]),
+            "foreign_count":   sum(1 for x in out if not x["is_pakistani"]),
         }
     except Exception as e:
         return {"fleet": [{"tail_number": "Error", "current_flight": str(e)}]}
@@ -1319,14 +1522,23 @@ def get_pakistan_fleet():
         for r in rows:
             r = dict(r)
             fs_status = r.get("fs_status")
-            if fs_status in ("airborne", "grounded"):
-                status = fs_status
+            fs_last   = r.get("fs_last_seen")
+
+            # An 'airborne' row is only trusted if it was seen recently.
+            # Stale rows (from an earlier session or a missed cycle) are treated
+            # as grounded, so every page reports the same airborne count.
+            fresh = bool(fs_last) and fs_last >= _fresh_cutoff()
+
+            if fs_status == "airborne" and fresh:
+                status = "airborne"
+            elif fs_status in ("airborne", "grounded"):
+                status = "grounded"
             elif r.get("altitude") and r["altitude"] > 100:
                 status = "airborne"
             else:
                 status = "grounded"
 
-            live_callsign = r.get("fs_callsign") or (r.get("callsign") if status == "airborne" else None)
+            live_callsign = (r.get("fs_callsign") if status == "airborne" else None)
 
             fleet.append({
                 "tail_number":    r["tail_number"],
@@ -1920,7 +2132,9 @@ def get_pipeline_logs():
 
 @app.get("/api/fleet_status")
 def get_fleet_status():
-    """Returns current airborne/grounded status for all fleet planes."""
+    """Returns current airborne/grounded status for all fleet planes.
+    An 'airborne' row is only counted if it was seen within the recency window,
+    so this agrees with /api/pak_fleet and the frontend pages."""
     conn = get_raw_conn()
     try:
         rows = conn.execute("""
@@ -1935,22 +2149,33 @@ def get_fleet_status():
     finally:
         conn.close()
 
-    airborne = sum(1 for r in rows if r[3] == "airborne")
-    grounded = sum(1 for r in rows if r[3] == "grounded")
+    cutoff = _fresh_cutoff()
+
+    def effective_status(raw_status, last_seen):
+        # Stale 'airborne' rows are reported as grounded.
+        if raw_status == "airborne":
+            return "airborne" if (last_seen and last_seen >= cutoff) else "grounded"
+        return raw_status
+
+    aircraft = []
+    for r in rows:
+        st = effective_status(r[3], r[4])
+        aircraft.append({
+            "tail_number":    r[0],
+            "airline":        r[1],
+            "aircraft_type":  r[2],
+            "status":         st,
+            "last_seen":      r[4],
+            "callsign":       r[5] if st == "airborne" else None,
+            "departure":      r[6],
+            "arrival":        r[7],
+        })
+
+    airborne = sum(1 for a in aircraft if a["status"] == "airborne")
+    grounded = sum(1 for a in aircraft if a["status"] == "grounded")
 
     return {
         "summary":  {"airborne": airborne, "grounded": grounded,
-                     "unknown": len(rows) - airborne - grounded},
-        "aircraft": [
-            {
-                "tail_number":    r[0],
-                "airline":        r[1],
-                "aircraft_type":  r[2],
-                "status":         r[3],
-                "last_seen":      r[4],
-                "callsign":       r[5],
-                "departure":      r[6],
-                "arrival":        r[7],
-            } for r in rows
-        ],
+                     "unknown": len(aircraft) - airborne - grounded},
+        "aircraft": aircraft,
     }
