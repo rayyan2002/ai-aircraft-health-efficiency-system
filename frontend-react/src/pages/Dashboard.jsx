@@ -11,7 +11,7 @@ export default function Dashboard() {
   const [fleetLoad, setFleetLoad] = useState(true)
   const [noLive, setNoLive]     = useState(false)
   const [scope, setScope]       = useState('pak')   // 'pak' | 'all'
-  const [counts, setCounts]     = useState({ pakistani_count: 0, foreign_count: 0 })
+  const [counts, setCounts]     = useState({ pakistani_count: 0, foreign_count: 0, in_fleet_count: 0 })
   const [mapAircraft, setMapAircraft] = useState([])
   const [trail, setTrail]       = useState([])
 
@@ -20,7 +20,7 @@ export default function Dashboard() {
       const list = r.data.fleet || []
       if (list.length && list[0].tail_number !== 'No live flights' && list[0].tail_number !== 'Error') {
         setFleet(list); setNoLive(false)
-        setCounts({ pakistani_count: r.data.pakistani_count || 0, foreign_count: r.data.foreign_count || 0 })
+        setCounts({ pakistani_count: r.data.pakistani_count || 0, foreign_count: r.data.foreign_count || 0, in_fleet_count: r.data.in_fleet_count || 0 })
         setSel(prev => prev || list[0].tail_number)
       } else {
         setFleet([]); setNoLive(true)
@@ -59,7 +59,7 @@ export default function Dashboard() {
   return (
     <Page eyebrow="OpenSky Network — Real-Time ADS-B" title="Live Anomaly Monitor"
       subtitle="Real-time flight-behaviour monitoring and anomaly detection over the region"
-      right={<Badge color={noLive ? C.yellow : C.green}>{noLive ? 'No live flights' : `${counts.pakistani_count} PK \u00b7 ${counts.foreign_count} foreign`}</Badge>}>
+      right={<Badge color={noLive ? C.yellow : C.green}>{noLive ? 'No live flights' : `${counts.pakistani_count} PK flights \u00b7 ${counts.in_fleet_count} in tracked fleet \u00b7 ${counts.foreign_count} foreign`}</Badge>}>
 
       {/* Scope note — sets expectations honestly */}
       <div style={{ background: 'rgba(56,139,253,0.06)', border: `1px solid ${C.border}`, borderRadius: 10, padding: '12px 16px', marginBottom: 20, fontSize: 12, color: C.muted, lineHeight: 1.6 }}>

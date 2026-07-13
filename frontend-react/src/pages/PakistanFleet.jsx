@@ -1,27 +1,7 @@
 import { useState, useEffect } from 'react'
-import { MapContainer, TileLayer, Marker, Polyline, Popup, CircleMarker, useMap } from 'react-leaflet'
-import L from 'leaflet'
-import 'leaflet/dist/leaflet.css'
+import LiveMap from '../components/LiveMap'
 import { useLocation } from 'react-router-dom'
-import { getPakFleet, analyzePak, getPakRoute } from '../api'
-
-delete L.Icon.Default.prototype._getIconUrl
-L.Icon.Default.mergeOptions({
-  iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png',
-  iconUrl:       'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png',
-  shadowUrl:     'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png',
-})
-
-function FlyTo({ lat, lon }) {
-  const map = useMap()
-  useEffect(() => { if (lat && lon) map.flyTo([lat, lon], 6, { duration: 1.2 }) }, [lat, lon])
-  return null
-}
-
-const planeIcon = color => L.divIcon({
-  html: `<div style="font-size:22px;line-height:1">✈</div>`,
-  iconSize:[24,24], iconAnchor:[12,12], className:'',
-})
+import { getPakFleet, analyzePak, getLiveTrack, toIATA, AIRLINE_ALIAS } from '../api'
 
 const hCol = s => s >= 70 ? '#3fb950' : s >= 40 ? '#d29922' : '#f85149'
 
@@ -29,13 +9,6 @@ const ALIAS = {
   'PIA':'PIA','Pakistan International Airlines':'PIA',
   'AirBlue':'AirBlue','AirSial':'AirSial',
   'FlyJinnah':'FlyJinnah','Fly Jinnah':'FlyJinnah',
-}
-
-const toIATA = cs => {
-  if (!cs || cs === 'Grounded') return '—'
-  const m = {PIA:'PK',ABQ:'PA',FJL:'9P',SIF:'PF'}
-  for (const [k,v] of Object.entries(m)) if (cs.startsWith(k)) return v+cs.slice(k.length)
-  return cs
 }
 
 const Card = ({children, style={}}) => (
@@ -58,7 +31,7 @@ export default function PakistanFleet() {
   const [airline,    setAirline]    = useState('')
   const [tail,       setTail]       = useState('')
   const [analysis,   setAnalysis]   = useState(null)
-  const [route,      setRoute]      = useState(null)
+  const [trail,      setTrail]      = useState([])
   const [loading,    setLoading]    = useState(false)
   const [error,      setError]      = useState('')
 
@@ -99,19 +72,29 @@ export default function PakistanFleet() {
 
   useEffect(() => {
     if (!tail) return
-    setLoading(true); setError(''); setAnalysis(null); setRoute(null)
+    setLoading(true); setError(''); setAnalysis(null); setTrail([])
+
+    // The trail endpoint keys on CALLSIGN (the live flight), not the
+    // registration. Look up this aircraft's current callsign from the fleet
+    // list; if it's grounded there is no callsign and no trail to fetch.
+    const plane = fleet.find(p => p.tail_number === tail)
+    const cs = plane?.status === 'airborne'
+      ? (plane.current_flight || plane.callsign)
+      : null
+
     Promise.all([
       analyzePak(tail).catch(e => ({ data: null, error: e.response?.status })),
-      getPakRoute(tail).catch(() => ({ data: null }))
+      cs ? getLiveTrack(cs).catch(() => ({ data: { points: [] } }))
+         : Promise.resolve({ data: { points: [] } }),
     ])
-      .then(([a, r]) => {
+      .then(([a, t]) => {
         if (a.data) setAnalysis(a.data)
-        if (r.data) setRoute(r.data)
-        if (!a.data) setError(`No telemetry data for ${tail} yet — run fetch_opensky.py to populate`)
+        setTrail(t.data?.points || [])
+        if (!a.data) setError(`No analysis available for ${tail} yet.`)
       })
       .catch(e => setError(`Failed to load ${tail}: ${e.message}`))
       .finally(() => setLoading(false))
-  }, [tail])
+  }, [tail, fleet])
 
   const planes   = fleet.filter(p => p.airline === airline)
   const selPlane = fleet.find(p => p.tail_number === tail) || {}
@@ -124,8 +107,6 @@ export default function PakistanFleet() {
   const rul      = analysis?.predicted_rul_cycles || '—'
   const risk     = analysis?.risk_level || '—'
   const isEst    = analysis?.anomaly_flag === 1
-  const routePts = (route?.route_points || []).filter(p => p.lat && p.lon)
-  const coords   = routePts.map(p => [p.lat, p.lon])
 
   return (
     <div style={{padding:'28px 36px', maxWidth:1500, margin:'0 auto'}}>
@@ -180,7 +161,7 @@ export default function PakistanFleet() {
       {/* Airline + aircraft selectors */}
       <div style={{display:'flex',gap:10,marginBottom:20,flexWrap:'wrap',alignItems:'center'}}>
         {airlines.map(a => (
-          <button key={a} onClick={()=>{ setAirline(a); setTail(''); setAnalysis(null); setRoute(null) }}
+          <button key={a} onClick={()=>{ setAirline(a); setTail(''); setAnalysis(null); setTrail([]) }}
             style={{
               padding:'6px 16px', borderRadius:20, fontSize:12, cursor:'pointer',
               border: airline===a ? '1px solid #388bfd' : '1px solid #21262d',
@@ -256,37 +237,38 @@ export default function PakistanFleet() {
         </div>
       )}
 
-      {/* Map + SHAP */}
+      {/* Map + diagnostics */}
       {tail && (
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginBottom:20}}>
 
-        {/* Map */}
+        {/* Map — only meaningful when the aircraft is actually flying */}
         <Card style={{padding:0,overflow:'hidden'}}>
           <div style={{padding:'12px 16px',borderBottom:'1px solid #21262d'}}>
-            <Lbl>Live Position & Flight Path</Lbl>
+            <Lbl>{isAirborne ? 'Live Position & Track' : 'Position'}</Lbl>
           </div>
-          <div style={{height:360}}>
-            <MapContainer center={[lat,lon]} zoom={5} style={{height:'100%',width:'100%'}}>
-              <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                attribution='&copy; OpenStreetMap'/>
-              <FlyTo lat={lat} lon={lon}/>
-              {coords.length > 1 && (
-                <Polyline positions={coords} color="#388bfd" weight={2} dashArray="6 4" opacity={0.8}/>
-              )}
-              {coords.length > 2 && coords.slice(1,-1).filter((_,i)=>i%3===0).map((pt,i)=>(
-                <CircleMarker key={i} center={pt} radius={3} color="#388bfd" fillOpacity={0.5}/>
-              ))}
-              <Marker position={[lat,lon]} icon={planeIcon(hCol(health))}>
-                <Popup>
-                  <b>{toIATA(analysis?.callsign||tail)}</b><br/>
-                  Alt: {lt.alt_m?.toFixed(0)||'—'}m · {lt.speed_ms?.toFixed(1)||'—'} m/s
-                </Popup>
-              </Marker>
-            </MapContainer>
-          </div>
-          {isEst && (
-            <div style={{padding:'7px 16px',fontSize:11,color:'#484f58',borderTop:'1px solid #21262d'}}>
-              ⚠ Position estimated from scheduled route — live GPS unavailable on free tier
+          {isAirborne && selPlane.latitude != null ? (
+            <LiveMap
+              aircraft={[{
+                hex: selPlane.hex_code, callsign: flightNo || tail,
+                lat: selPlane.latitude, lon: selPlane.longitude,
+                altitude: selPlane.altitude, velocity: selPlane.velocity,
+                track: selPlane.track ?? 0, in_fleet: true, anomaly: analysis?.anomaly_flag === 1,
+                tail_number: tail, airline: ALIAS[selPlane.airline]||selPlane.airline,
+                aircraft_type: selPlane.aircraft_type, is_pakistani: true,
+              }]}
+              selected={flightNo || tail}
+              trail={trail}
+              height={360}
+            />
+          ) : (
+            <div style={{height:360,display:'flex',flexDirection:'column',alignItems:'center',
+                         justifyContent:'center',gap:8,color:'#484f58'}}>
+              <div style={{fontSize:34}}>🅿</div>
+              <div style={{fontSize:14,color:'#7d8590'}}>Aircraft is on the ground</div>
+              <div style={{fontSize:12,textAlign:'center',maxWidth:280,lineHeight:1.5}}>
+                No live position is broadcast while parked. The map appears when
+                this aircraft is airborne and transmitting ADS-B.
+              </div>
             </div>
           )}
         </Card>
@@ -294,26 +276,44 @@ export default function PakistanFleet() {
         {/* Right column */}
         <div style={{display:'flex',flexDirection:'column',gap:12}}>
 
-          {/* SHAP */}
+          {/* Diagnostics — split honestly by whether the aircraft is flying */}
           <Card style={{flex:1}}>
-            <Lbl>ML Diagnostics — Feature Attribution</Lbl>
+            <Lbl>
+              {isAirborne ? 'ML Diagnostics — Feature Attribution' : 'Engine Health Diagnostics'}
+            </Lbl>
+
+            {!isAirborne && (
+              <div style={{fontSize:11,color:'#7d8590',marginBottom:12,lineHeight:1.6,
+                           background:'rgba(56,139,253,0.05)',border:'1px solid #21262d',
+                           borderRadius:6,padding:'8px 10px'}}>
+                This aircraft is grounded, so there is no live telemetry to analyse.
+                Anomaly detection and flight-phase attribution require an active flight.
+                The figures below come from the engine-wear model, which is based on
+                accumulated cycles and is valid whether or not the aircraft is flying.
+              </div>
+            )}
+
             {analysis?.explainability_shap ? (
-              analysis.explainability_shap.map((item,i)=>{
-                const max = Math.max(...analysis.explainability_shap.map(x=>Math.abs(x.impact)))
-                const pct = max>0 ? (Math.abs(item.impact)/max)*100 : 0
-                const col = item.impact < 0 ? '#f85149' : '#3fb950'
-                return (
-                  <div key={i} style={{marginBottom:10}}>
-                    <div style={{display:'flex',justifyContent:'space-between',marginBottom:3}}>
-                      <span style={{fontSize:11,color:'#7d8590'}}>{item.feature}</span>
-                      <span style={{fontSize:11,color:col,fontFamily:'monospace'}}>{item.impact.toFixed(2)}</span>
+              analysis.explainability_shap
+                // On the ground, hide the live-telemetry features — showing an
+                // "ADS-B anomaly score" for a parked aircraft would be dishonest.
+                .filter(item => isAirborne || /RUL|wear|engine|cycle/i.test(item.feature))
+                .map((item,i,arr)=>{
+                  const max = Math.max(...arr.map(x=>Math.abs(x.impact)), 0.0001)
+                  const pct = (Math.abs(item.impact)/max)*100
+                  const col = item.impact < 0 ? '#f85149' : '#3fb950'
+                  return (
+                    <div key={i} style={{marginBottom:10}}>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:3}}>
+                        <span style={{fontSize:11,color:'#7d8590'}}>{item.feature}</span>
+                        <span style={{fontSize:11,color:col,fontFamily:'monospace'}}>{item.impact.toFixed(2)}</span>
+                      </div>
+                      <div style={{height:5,background:'#21262d',borderRadius:3}}>
+                        <div style={{height:'100%',width:`${pct}%`,background:col,borderRadius:3}}/>
+                      </div>
                     </div>
-                    <div style={{height:5,background:'#21262d',borderRadius:3}}>
-                      <div style={{height:'100%',width:`${pct}%`,background:col,borderRadius:3}}/>
-                    </div>
-                  </div>
-                )
-              })
+                  )
+                })
             ) : (
               <div style={{fontSize:12,color:'#484f58'}}>{loading ? 'Loading...' : 'No data'}</div>
             )}
@@ -324,17 +324,23 @@ export default function PakistanFleet() {
             <Lbl>Aircraft Info</Lbl>
             {[
               ['Registration', tail],
-              ['Type',         analysis?.aircraft_type||'—'],
-              ['Airline',      ALIAS[analysis?.airline]||analysis?.airline||'—'],
-              ['Flight No.',   toIATA(analysis?.callsign||'')],
-              ['Flight Phase', (analysis?.flight_phase||'—').replace(/_/g,' ')],
-              ['Wind',         `${analysis?.route_and_emissions?.weather_wind_ms||'—'} m/s`],
-              ['Temp',         `${analysis?.route_and_emissions?.temp_c||'—'}°C`],
-              ['ADS-B Score',  analysis?.iforest_score?.toFixed(4)||'—'],
+              ['Type',         selPlane.aircraft_type || analysis?.aircraft_type || '—'],
+              ['Airline',      ALIAS[selPlane.airline] || selPlane.airline || '—'],
+              ['Status',       isAirborne ? 'Airborne' : 'Grounded'],
+              // Flight number comes from fleet_status (hex-reconciled), not from
+              // the analysis payload — a grounded aircraft has no flight number.
+              ['Flight No.',   isAirborne && flightNo ? toIATA(flightNo) : '—'],
+              ['Flight Phase', isAirborne ? (analysis?.flight_phase||'—').replace(/_/g,' ') : '—'],
+              ['ADS-B Score',  isAirborne ? (analysis?.iforest_score?.toFixed(4) ?? '—') : '—'],
+              ['Hex Code',     selPlane.hex_code || '—'],
             ].map(([k,v])=>(
-              <div key={k} style={{display:'flex',justifyContent:'space-between',padding:'5px 0',borderBottom:'1px solid #21262d',fontSize:12}}>
+              <div key={k} style={{display:'flex',justifyContent:'space-between',padding:'5px 0',
+                                   borderBottom:'1px solid #21262d',fontSize:12}}>
                 <span style={{color:'#7d8590'}}>{k}</span>
-                <span style={{color:'#e6edf3',fontFamily:['Registration','Flight No.'].includes(k)?'Orbitron, monospace':'Inter'}}>{v}</span>
+                <span style={{
+                  color: v === '—' ? '#484f58' : '#e6edf3',
+                  fontFamily: ['Registration','Flight No.','Hex Code'].includes(k) ? 'Orbitron, monospace' : 'Inter',
+                }}>{v}</span>
               </div>
             ))}
           </Card>

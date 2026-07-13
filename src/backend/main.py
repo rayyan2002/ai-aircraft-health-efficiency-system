@@ -511,7 +511,23 @@ def _get_row_count(table: str) -> int:
         return 0
 
 
-def _fresh_cutoff(minutes: int = 30) -> str:
+# ── Flight-state timing ───────────────────────────────────────────────
+# How long an aircraft may go unseen on ADS-B before we stop calling it
+# airborne. The pipeline runs every 5 minutes and an airborne aircraft should
+# appear in essentially every cycle, so a long window just means landed
+# aircraft linger as "airborne" and landings get logged late.
+#
+# 30 min was far too generous — an aircraft that had landed kept showing as
+# airborne for another half hour. 12 minutes gives roughly two missed cycles of
+# tolerance (for OpenSky coverage gaps) while keeping the display current.
+#
+# Trade-off if you tune this:
+#   LOWER  -> more responsive, but aircraft may flicker if OpenSky misses a cycle
+#   HIGHER -> steadier, but landed aircraft linger as airborne
+AIRBORNE_TIMEOUT_MIN = 12
+
+
+def _fresh_cutoff(minutes: int = AIRBORNE_TIMEOUT_MIN) -> str:
     """
     Shared recency cutoff for 'is this aircraft really airborne right now?'.
     Returns a space-separated timestamp string matching how SQLite stores them
@@ -575,7 +591,7 @@ def reconcile_opensky_fleet_status():
         # IMPORTANT: flight_telemetry.timestamp is stored space-separated
         # ("2026-06-16 19:15:51"); the cutoff MUST use the same format.
         # .isoformat() would give "...T19:..." and break the text comparison.
-        cutoff = (_datetime.now() - _timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff = (_datetime.now() - _timedelta(minutes=AIRBORNE_TIMEOUT_MIN)).strftime("%Y-%m-%d %H:%M:%S")
         live_rows = conn.execute("""
             SELECT tail_number AS hex, callsign, MAX(timestamp) AS last_seen,
                    latitude, longitude, altitude, velocity
@@ -769,80 +785,31 @@ async def automated_data_pipeline():
             except Exception as e:
                 errors.append(f"weather:{e}")
 
-            # ── Step 4: Update fleet_status for active planes ──
-            conn_fs = _sqlite3.connect(DB_PATH)
-            for tail in current_active:
-                conn_fs.execute("""
-                    INSERT INTO fleet_status (tail_number, status, last_seen)
-                    VALUES (?, 'airborne', ?)
-                    ON CONFLICT(tail_number) DO UPDATE SET
-                        status='airborne', last_seen=excluded.last_seen
-                """, (tail, _datetime.now().isoformat()))
-            conn_fs.commit()
-
-            # ── Step 5: Absence detection — who just landed? ──
-            just_landed = prev_active - current_active
-            for tail in just_landed:
-                print(f"🛬 ABSENCE DETECTED — {tail} no longer active. Logging flight...")
-
-                # Get last known telemetry
-                last_row = conn_fs.execute("""
-                    SELECT altitude, velocity, callsign,
-                           COALESCE(departure_airport, 'Unknown') as departure_airport,
-                           COALESCE(arrival_airport, 'Unknown') as arrival_airport
-                    FROM pakistan_telemetry
-                    WHERE tail_number = ?
-                    ORDER BY id DESC LIMIT 1
-                """, (tail,)).fetchone()
-
-                if last_row:
-                    alt_last = last_row[0] or 0
-                    vel_last = last_row[1] or 0
-                    callsign = last_row[2] or tail
-                    origin   = last_row[3] or "Unknown"
-                    dest     = last_row[4] or "Unknown"
-                else:
-                    alt_last = vel_last = 0
-                    callsign = tail
-                    origin   = dest = "Unknown"
-
-                # Calculate metrics
-                fuel = round(compute_fuel_burn(alt_last, vel_last, 30), 1)
-                co2  = round(fuel * 2.53, 1)
-
-                final_health = 45.2
-                if lstm_model and lstm_scaler:
-                    try:
-                        sd = np.zeros((30, 24))
-                        sd[:, 0] = alt_last / 1000
-                        sd[:, 1] = vel_last
-                        scaled = lstm_scaler.transform(sd)
-                        rul = float(lstm_model.predict(scaled.reshape(1,30,24), verbose=0)[0][0])
-                        final_health = round(min(100, max(0, rul / 2)), 1)
-                    except:
-                        pass
-
-                # Insert into flight_history
-                db.add(models_db.FlightHistory(
-                    tail_number       = tail,
-                    origin            = origin,
-                    destination       = dest,
-                    total_fuel_liters = fuel,
-                    co2_kg            = co2,
-                    final_health_score= final_health,
-                ))
-                db.commit()
-                landings_logged += 1
-
-                # Update fleet_status to grounded
-                conn_fs.execute("""
-                    UPDATE fleet_status SET status='grounded', last_seen=?
-                    WHERE tail_number=?
-                """, (_datetime.now().isoformat(), tail))
-                conn_fs.commit()
-                print(f"  ✅ {tail} → flight_history | fuel={fuel}L health={final_health}")
-
-            conn_fs.close()
+            # ── Steps 4 & 5: LEGACY AviationStack lander — DISABLED ──
+            #
+            # WHY THIS IS OFF:
+            # These steps derived "who is airborne" from AviationStack via
+            # `current_active`, then landed everyone who wasn't in that set:
+            #
+            #     just_landed = prev_active - current_active
+            #
+            # AviationStack's free tier returns ZERO flights, so current_active
+            # was always an empty set — which meant just_landed became EVERY
+            # aircraft that was airborne. Every cycle, it grounded the entire
+            # fleet immediately after the hex reconciliation (Step 2b) had
+            # correctly marked them airborne from live OpenSky data.
+            #
+            # Symptom in the log:
+            #     ✈️  Airborne fleet aircraft (5): AP-BOK, AP-BOM, ...
+            #     🛬 ABSENCE DETECTED — AP-BOO no longer active.   <-- same cycle!
+            #
+            # Flight lifecycle (airborne detection AND landing detection) is now
+            # owned entirely by reconcile_opensky_fleet_status() in Step 2b,
+            # which matches live ADS-B hex codes against fleet.hex_code.
+            #
+            # Do not re-enable without first confirming AviationStack actually
+            # returns data.
+            pass
 
             # ── Step 6: Legacy auto-lander — DISABLED ──
             # Superseded by Step 2b hex-based reconciliation.
@@ -1137,7 +1104,7 @@ def get_live_map():
     """
     conn = get_raw_conn()
     try:
-        cutoff = _fresh_cutoff(30)
+        cutoff = _fresh_cutoff()
 
         # Latest row per aircraft in the window
         rows = conn.execute("""
@@ -1239,7 +1206,7 @@ def get_live_fleet(db: Session = Depends(get_db)):
     ordered newest-first. Never touches the locked fleet table.
     """
     try:
-        cutoff = _datetime.now() - _timedelta(minutes=30)
+        cutoff = _datetime.now() - _timedelta(minutes=AIRBORNE_TIMEOUT_MIN)
         rows = (
             db.query(
                 models_db.FlightTelemetry.callsign,
@@ -1286,10 +1253,35 @@ def get_live_fleet(db: Session = Depends(get_db)):
         # Pakistani carriers first, then foreign traffic
         out.sort(key=lambda x: (not x["is_pakistani"], x["tail_number"]))
 
+        # How many of these live flights are flown by one of OUR 44 aircraft?
+        # Home counts tracked-fleet aircraft; this page counts flights. Without
+        # this number the two look contradictory ("7 PK" vs "6 airborne") when
+        # in fact they measure different things.
+        conn2 = get_raw_conn()
+        try:
+            fleet_hexes = {
+                (r["hex_code"] or "").strip().upper()
+                for r in conn2.execute(
+                    "SELECT hex_code FROM fleet WHERE hex_code IS NOT NULL"
+                ).fetchall()
+            }
+            cutoff2 = _fresh_cutoff()
+            live_hexes = {
+                (r["tail_number"] or "").strip().upper()
+                for r in conn2.execute(
+                    "SELECT DISTINCT tail_number FROM flight_telemetry WHERE timestamp >= ?",
+                    (cutoff2,)
+                ).fetchall()
+            }
+            in_fleet = len(fleet_hexes & live_hexes)
+        finally:
+            conn2.close()
+
         return {
             "fleet": out,
             "pakistani_count": sum(1 for x in out if x["is_pakistani"]),
             "foreign_count":   sum(1 for x in out if not x["is_pakistani"]),
+            "in_fleet_count":  in_fleet,
         }
     except Exception as e:
         return {"fleet": [{"tail_number": "Error", "current_flight": str(e)}]}
