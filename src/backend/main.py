@@ -144,6 +144,7 @@ def fetch_and_insert_opensky():
         cursor = conn.cursor()
 
         saved = 0
+        anomalies = 0
         limit = 100
         # ICAO callsign prefixes for Pakistani carriers.
         #   PIA = Pakistan International Airlines
@@ -187,18 +188,35 @@ def fetch_and_insert_opensky():
             if callsign == "UNKNOWN":
                 continue
 
+            # Run the Isolation Forest NOW and persist the result.
+            # Previously anomaly_flag was hardcoded to 0 and the model only ran
+            # on-demand inside pak_analyze — so the stored flag was always false
+            # and the map could never show a real anomaly.
+            try:
+                a_flag, a_score = run_iforest(
+                    velocity=float(vel or 0),
+                    altitude=float(alt or 0),
+                    vertical_rate=float(vrate or 0),
+                    true_track=float(track or 0),
+                )
+            except Exception:
+                a_flag, a_score = 0, None
+
             cursor.execute("""
                 INSERT INTO flight_telemetry
                 (tail_number, callsign, altitude, velocity,
                  latitude, longitude, track, vertical_rate, anomaly_flag, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (icao24, callsign, alt, vel, lat, lon,
-                  track, vrate, _datetime.now()))
+                  track, vrate, a_flag, _datetime.now()))
             saved += 1
+            if a_flag:
+                anomalies += 1
 
         conn.commit()
         conn.close()
-        print(f"✅ [OpenSky] Saved {saved} live flights to flight_telemetry.")
+        print(f"✅ [OpenSky] Saved {saved} live flights to flight_telemetry "
+              f"({anomalies} flagged as anomalous by Isolation Forest).")
 
     except Exception as e:
         print(f"❌ [OpenSky] Error: {e}")
@@ -501,6 +519,29 @@ def _fresh_cutoff(minutes: int = 30) -> str:
     Every status-reporting endpoint uses this so all pages agree on the count.
     """
     return (_datetime.now() - _timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+
+def _effective_status(fs_status, fs_last_seen, cutoff=None):
+    """
+    THE single source of truth for 'is this aircraft airborne right now?'
+
+    Every endpoint MUST use this. Previously pak_fleet had an extra fallback
+    (guessing 'airborne' from a stale pakistan_telemetry altitude > 100m) while
+    fleet_status did not — so Home and Fleet Overview reported different
+    airborne counts for the same fleet. There is now exactly one rule:
+
+      airborne  <=> fleet_status says 'airborne' AND it was seen within the
+                    recency window.
+      otherwise <=> grounded.
+
+    No altitude guessing. No fallbacks. One rule, one answer, every page.
+    """
+    if cutoff is None:
+        cutoff = _fresh_cutoff()
+    if fs_status == "airborne" and fs_last_seen and str(fs_last_seen) >= cutoff:
+        return "airborne"
+    return "grounded"
 
 
 def reconcile_opensky_fleet_status():
@@ -1490,6 +1531,118 @@ def get_raw_conn():
     return conn
 
 
+# ── Fleet health cache ────────────────────────────────────────────────
+# Health/RUL are derived from each aircraft's accumulated engine cycles, which
+# do NOT change during a session. Recomputing them on every page load meant 44
+# LSTM inferences per visit, on four different pages. We compute once and cache.
+# The cache is invalidated when maintenance is logged (which resets an aircraft).
+_FLEET_HEALTH_CACHE = {}       # tail -> {health, rul, risk, cycles}
+_FLEET_HEALTH_BUILT = False
+
+
+def _invalidate_fleet_health(tail: str = None):
+    """Drop cached health. Call after maintenance changes an aircraft."""
+    global _FLEET_HEALTH_BUILT
+    if tail:
+        _FLEET_HEALTH_CACHE.pop(tail, None)
+    else:
+        _FLEET_HEALTH_CACHE.clear()
+    _FLEET_HEALTH_BUILT = False
+
+
+@app.get("/api/fleet_health")
+def get_fleet_health(refresh: bool = False):
+    """
+    Health, RUL and risk for ALL fleet aircraft in ONE call.
+
+    Replaces 44 separate /api/pak_analyze requests from the frontend.
+    Results are cached because they depend on accumulated cycles, which are
+    static within a session. Pass ?refresh=true to force recomputation.
+    """
+    global _FLEET_HEALTH_BUILT
+
+    _t0 = _datetime.now()
+
+    if refresh:
+        _invalidate_fleet_health()
+        print("🔄 [fleet_health] Cache cleared — recomputing all aircraft "
+              "through the LSTM (this is the real model running).")
+
+    conn = get_raw_conn()
+    try:
+        fleet_rows = conn.execute("""
+            SELECT tail_number, aircraft_type, airline, total_cycles
+            FROM fleet ORDER BY airline, tail_number
+        """).fetchall()
+    finally:
+        conn.close()
+
+    out, computed = [], 0
+
+    for r in fleet_rows:
+        tail = r["tail_number"]
+
+        if tail in _FLEET_HEALTH_CACHE:
+            entry = _FLEET_HEALTH_CACHE[tail]
+        else:
+            cycles = float(r["total_cycles"] or 15000)
+            try:
+                if lstm_model is not None and lstm_scaler is not None:
+                    rul = _predict_rul_from_cycles(cycles, 9000.0, 220.0)
+                else:
+                    # Model unavailable — fall back to the wear anchor alone.
+                    wear = min(0.95, cycles / 50000)
+                    rul = max(5.0, min(123.0, 123 - wear * (123 - 5)))
+
+                health = round(min(100, max(0, (rul - 5) / (123 - 5) * 100)), 1)
+                risk = "High" if rul < 20 else "Moderate" if rul < 50 else "Low"
+
+                entry = {
+                    "health_score":         health,
+                    "predicted_rul_cycles": round(rul, 1),
+                    "risk_level":           risk,
+                    "total_cycles":         cycles,
+                }
+                _FLEET_HEALTH_CACHE[tail] = entry
+                computed += 1
+            except Exception as e:
+                print(f"⚠️ fleet_health failed for {tail}: {e}")
+                entry = {
+                    "health_score": None, "predicted_rul_cycles": None,
+                    "risk_level": "Unknown", "total_cycles": r["total_cycles"],
+                }
+
+        out.append({
+            "tail_number":   tail,
+            "aircraft_type": r["aircraft_type"],
+            "airline":       r["airline"],
+            **entry,
+        })
+
+    _FLEET_HEALTH_BUILT = True
+
+    elapsed_ms = int((_datetime.now() - _t0).total_seconds() * 1000)
+    if computed:
+        print(f"🎯 [fleet_health] Ran the LSTM on {computed} aircraft "
+              f"in {elapsed_ms} ms.")
+
+    scored = [a["health_score"] for a in out if a["health_score"] is not None]
+    return {
+        "fleet":       out,
+        "total":       len(out),
+        "computed":    computed,                 # how many actually ran the model
+        "cached":      len(out) - computed,      # how many came from cache
+        "elapsed_ms":  elapsed_ms,
+        "model":       "LSTM (NASA C-MAPSS)" if lstm_model is not None else "wear-anchor fallback",
+        "summary": {
+            "avg_health": round(sum(scored) / len(scored), 1) if scored else None,
+            "healthy":    sum(1 for h in scored if h >= 70),
+            "moderate":   sum(1 for h in scored if 40 <= h < 70),
+            "critical":   sum(1 for h in scored if h < 40),
+        },
+    }
+
+
 @app.get("/api/pak_fleet")
 def get_pakistan_fleet():
     """
@@ -1524,19 +1677,10 @@ def get_pakistan_fleet():
             fs_status = r.get("fs_status")
             fs_last   = r.get("fs_last_seen")
 
-            # An 'airborne' row is only trusted if it was seen recently.
-            # Stale rows (from an earlier session or a missed cycle) are treated
-            # as grounded, so every page reports the same airborne count.
-            fresh = bool(fs_last) and fs_last >= _fresh_cutoff()
-
-            if fs_status == "airborne" and fresh:
-                status = "airborne"
-            elif fs_status in ("airborne", "grounded"):
-                status = "grounded"
-            elif r.get("altitude") and r["altitude"] > 100:
-                status = "airborne"
-            else:
-                status = "grounded"
+            # ONE shared rule — identical to /api/fleet_status.
+            # (Previously this had an extra 'altitude > 100' fallback which made
+            #  Fleet Overview report a different airborne count than Home.)
+            status = _effective_status(fs_status, fs_last)
 
             live_callsign = (r.get("fs_callsign") if status == "airborne" else None)
 
@@ -1885,6 +2029,9 @@ def log_maintenance(data: MaintenanceLogRequest, db: Session = Depends(get_db)):
     Mechanic Portal — full implementation.
     Saves maintenance record and resets aircraft health baseline to 100%.
     """
+    # Maintenance changes this aircraft's health, so drop its cached value.
+    _invalidate_fleet_health(data.tail_number)
+
     # ── 1. Save to maintenance_records via raw SQLite (always) ──
     conn = get_raw_conn()
     try:
@@ -2151,15 +2298,10 @@ def get_fleet_status():
 
     cutoff = _fresh_cutoff()
 
-    def effective_status(raw_status, last_seen):
-        # Stale 'airborne' rows are reported as grounded.
-        if raw_status == "airborne":
-            return "airborne" if (last_seen and last_seen >= cutoff) else "grounded"
-        return raw_status
-
     aircraft = []
     for r in rows:
-        st = effective_status(r[3], r[4])
+        # SAME shared rule as /api/pak_fleet — see _effective_status()
+        st = _effective_status(r[3], r[4], cutoff)
         aircraft.append({
             "tail_number":    r[0],
             "airline":        r[1],
