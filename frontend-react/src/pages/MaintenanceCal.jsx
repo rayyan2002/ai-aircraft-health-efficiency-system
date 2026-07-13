@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
-import { getPakFleet, analyzePak, shortAirline, healthColor, riskColor, AIRLINE_ALIAS } from '../api'
+import { getPakFleet, getFleetHealth, shortAirline, healthColor, riskColor, AIRLINE_ALIAS } from '../api'
+import RecomputeButton from '../components/RecomputeButton'
 import { Page, Card, Label, Badge, Empty, Spinner, C } from '../components/ui'
 
 // Map RUL to a recommended check + days-until-due.
@@ -16,29 +17,29 @@ export default function MaintenanceCal() {
   const [loading, setLoading] = useState(true)
   const [progress, setProgress] = useState(0)
 
+  // Build the schedule from ONE cached health call instead of 44 requests.
+  const build = (arr) => {
+    const out = (arr || [])
+      .filter(a => a.predicted_rul_cycles != null)
+      .map(a => ({
+        tail:    a.tail_number,
+        airline: AIRLINE_ALIAS[a.airline] || a.airline,
+        type:    a.aircraft_type,
+        rul:     a.predicted_rul_cycles,
+        health:  a.health_score,
+        risk:    a.risk_level,
+        ...schedule(a.predicted_rul_cycles),
+      }))
+      .sort((x, y) => x.days - y.days)
+    setItems(out)
+    setProgress(100)
+    setLoading(false)
+  }
+
   useEffect(() => {
-    let cancelled = false
-    getPakFleet().then(async r => {
-      const fleet = r.data.fleet || []
-      const out = []
-      for (let i = 0; i < fleet.length; i++) {
-        if (cancelled) return
-        const p = fleet[i]
-        try {
-          const a = await analyzePak(p.tail_number)
-          const rul = a.data.predicted_rul_cycles
-          const sch = schedule(rul)
-          out.push({
-            tail: p.tail_number, airline: AIRLINE_ALIAS[p.airline] || p.airline,
-            type: p.aircraft_type, rul, health: a.data.health_score,
-            risk: a.data.risk_level, ...sch,
-          })
-        } catch { /* skip */ }
-        setProgress(Math.round(((i + 1) / fleet.length) * 100))
-      }
-      if (!cancelled) { setItems(out.sort((x, y) => x.days - y.days)); setLoading(false) }
-    })
-    return () => { cancelled = true }
+    getFleetHealth()
+      .then(r => build(r.data.fleet))
+      .catch(() => { setProgress(100); setLoading(false) })
   }, [])
 
   if (loading) return (
@@ -59,7 +60,10 @@ export default function MaintenanceCal() {
   return (
     <Page eyebrow="Predictive Maintenance — Forward Schedule" title="Maintenance Calendar"
       subtitle="RUL-driven inspection schedule across all 44 aircraft"
-      right={<Badge color={urgent > 0 ? C.red : C.green}>{urgent} due this week</Badge>}>
+      right={<div style={{ display:'flex', alignItems:'flex-start', gap:12 }}>
+        <Badge color={urgent > 0 ? C.red : C.green}>{urgent} due this week</Badge>
+        <RecomputeButton onDone={build} />
+      </div>}>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
         {windows.map(w => {

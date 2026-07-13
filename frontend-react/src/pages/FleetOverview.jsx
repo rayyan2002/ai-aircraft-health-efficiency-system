@@ -1,200 +1,259 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getPakFleet } from '../api'
-
-const AIRLINE_SHORT = {
-  'PIA':        'PIA',
-  'AirBlue':    'AirBlue',
-  'AirSial':    'AirSial',
-  'FlyJinnah':  'FlyJinnah',
-  'Fly Jinnah': 'FlyJinnah',
-  'Pakistan International Airlines': 'PIA',
-}
+import { getPakFleet, getFleetHealth, AIRLINE_ALIAS, toIATA } from '../api'
+import { Page, Card, Label, Badge, Empty, Spinner, C } from '../components/ui'
+import RecomputeButton from '../components/RecomputeButton'
 
 const AIRLINE_COLOR = {
-  'PIA':        '#388bfd',
-  'Pakistan International Airlines': '#388bfd',
-  'AirBlue':    '#3fb950',
-  'AirSial':    '#d29922',
-  'FlyJinnah':  '#f85149',
-  'Fly Jinnah': '#f85149',
+  'PIA':       '#388bfd',
+  'AirBlue':   '#3fb950',
+  'AirSial':   '#d29922',
+  'FlyJinnah': '#f85149',
 }
-
-const FILTER_OPTIONS = ['All', 'PIA', 'AirBlue', 'AirSial', 'FlyJinnah']
+const FILTERS = ['All', 'PIA', 'AirBlue', 'AirSial', 'FlyJinnah']
 
 export default function FleetOverview() {
-  const navigate  = useNavigate()
+  const navigate = useNavigate()
   const [fleet,   setFleet]   = useState([])
-  const [loading, setLoading] = useState(true)
+  const [health,  setHealth]  = useState({})     // tail -> {health, rul, risk}
   const [filter,  setFilter]  = useState('All')
   const [sort,    setSort]    = useState('health')
+  const [loading, setLoading] = useState(true)
+  const [error,   setError]   = useState('')
+  const [healthReady, setHealthReady] = useState(false)
 
+  // Registry (fast) — refreshed every 30s to keep airborne status live
   useEffect(() => {
-    getPakFleet()
-      .then(r => setFleet(r.data.fleet || []))
-      .catch(console.error)
+    const load = () => getPakFleet()
+      .then(r => { setFleet(r.data.fleet || []); setError('') })
+      .catch(() => setError('Cannot reach the backend. Is uvicorn running on port 8000?'))
       .finally(() => setLoading(false))
-    const iv = setInterval(() => {
-      getPakFleet().then(r => setFleet(r.data.fleet || []))
-    }, 30000)
+    load()
+    const iv = setInterval(load, 30000)
     return () => clearInterval(iv)
   }, [])
 
-  const airlines = ['All', ...Object.keys(AIRLINE_SHORT)]
-  const filtered = fleet
-    .filter(p => {
-      if (filter === 'All') return true
-      const short = AIRLINE_SHORT[p.airline] || p.airline
-      return short === filter || p.airline === filter
-    })
-    .sort((a, b) => {
-      if (sort === 'health')  return (a.health_score||50) - (b.health_score||50)
-      if (sort === 'airline') return (a.airline||'').localeCompare(b.airline||'')
-      return (a.tail_number||'').localeCompare(b.tail_number||'')
-    })
-
-  const healthCol = (s) => s >= 70 ? '#3fb950' : s >= 40 ? '#d29922' : '#f85149'
-  const healthBg  = (s) => s >= 70 ? 'rgba(63,185,80,0.08)' : s >= 40 ? 'rgba(210,153,34,0.08)' : 'rgba(248,81,73,0.08)'
-
-  const stats = {
-    total:    fleet.length,
-    healthy:  fleet.filter(p => (p.health_score||50) >= 70).length,
-    moderate: fleet.filter(p => { const h=p.health_score||50; return h>=40&&h<70 }).length,
-    critical: fleet.filter(p => (p.health_score||50) < 40).length,
-    airborne: fleet.filter(p => p.status === 'airborne').length,
+  // Turn the fleet_health response into a tail -> {health, rul, risk} map
+  const applyHealth = (arr) => {
+    const map = {}
+    for (const a of arr || []) {
+      if (a.health_score != null) {
+        map[a.tail_number] = {
+          health: a.health_score,
+          rul:    a.predicted_rul_cycles,
+          risk:   a.risk_level,
+        }
+      }
+    }
+    setHealth(map)
+    setHealthReady(true)
   }
 
-  if (loading) return <div style={{ padding:'32px 40px', color:'#7d8590', fontSize:13 }}>Loading fleet...</div>
+  // Health for ALL aircraft in ONE call (server-side, cached).
+  // Previously this page fired 44 separate requests, each running an LSTM
+  // inference — ~30s per page visit. Now it's a single cached request.
+  useEffect(() => {
+    getFleetHealth()
+      .then(r => applyHealth(r.data.fleet))
+      .catch(() => setHealthReady(true))   // still show the fleet if health fails
+  }, [])
+
+  const hOf = (tail) => health[tail]?.health
+
+  const healthCol = (s) => s == null ? C.border : s >= 70 ? '#3fb950' : s >= 40 ? '#d29922' : '#f85149'
+  const riskCol   = (r) => r === 'Low' ? '#3fb950' : r === 'Moderate' ? '#d29922' : '#f85149'
+
+  const scored = Object.values(health).map(v => v.health)
+  const stats = {
+    total:    fleet.length,
+    airborne: fleet.filter(p => p.status === 'airborne').length,
+    healthy:  scored.filter(h => h >= 70).length,
+    moderate: scored.filter(h => h >= 40 && h < 70).length,
+    critical: scored.filter(h => h < 40).length,
+  }
+
+  const shown = fleet
+    .filter(p => filter === 'All' || (AIRLINE_ALIAS[p.airline] || p.airline) === filter)
+    .sort((a, b) => {
+      if (sort === 'health') {
+        const ha = hOf(a.tail_number), hb = hOf(b.tail_number)
+        if (ha == null && hb == null) return 0
+        if (ha == null) return 1
+        if (hb == null) return -1
+        return ha - hb
+      }
+      if (sort === 'airborne') return (b.status === 'airborne') - (a.status === 'airborne')
+      if (sort === 'airline')  return (a.airline || '').localeCompare(b.airline || '')
+      return (a.tail_number || '').localeCompare(b.tail_number || '')
+    })
+
+  if (loading) return <Page title="Fleet Overview"><Spinner text="Loading fleet..." /></Page>
+
+  if (error) return (
+    <Page title="Fleet Overview">
+      <Card style={{ borderColor: C.red }}>
+        <Empty><span style={{ color: C.red }}>{error}</span></Empty>
+      </Card>
+    </Page>
+  )
 
   return (
-    <div style={{ padding:'32px 40px', maxWidth:1400, margin:'0 auto' }}>
-
-      {/* Header */}
-      <div style={{ marginBottom:24 }}>
-        <div style={{ fontSize:10, color:'#484f58', letterSpacing:3, textTransform:'uppercase', marginBottom:4 }}>Pakistan Commercial Aviation</div>
-        <div style={{ fontFamily:'Orbitron, monospace', fontSize:24, fontWeight:900, color:'#e6edf3' }}>Fleet Overview</div>
-        <div style={{ fontSize:13, color:'#7d8590', marginTop:4 }}>All {fleet.length} verified active aircraft</div>
-      </div>
-
-      {/* Stats strip */}
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(5,1fr)', gap:12, marginBottom:24 }}>
+    <Page
+      eyebrow="Pakistan Commercial Aviation"
+      title="Fleet Overview"
+      subtitle="All 44 verified active aircraft"
+      right={
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+          <Badge color={healthReady ? C.green : C.accent}>
+            {healthReady ? `${scored.length} analyzed` : 'Analyzing…'}
+          </Badge>
+          <RecomputeButton onDone={applyHealth} />
+        </div>
+      }
+    >
+      {/* KPI strip */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 12, marginBottom: 20 }}>
         {[
-          { label:'Total Fleet',   value:stats.total,    color:'#388bfd' },
-          { label:'Airborne',      value:stats.airborne, color:'#3fb950' },
-          { label:'Healthy',       value:stats.healthy,  color:'#3fb950' },
-          { label:'Moderate Risk', value:stats.moderate, color:'#d29922' },
-          { label:'Critical',      value:stats.critical, color:'#f85149' },
+          { label: 'Total Fleet',   value: stats.total,    color: C.accent },
+          { label: 'Airborne',      value: stats.airborne, color: '#3fb950' },
+          { label: 'Healthy',       value: healthReady ? stats.healthy  : '··', color: '#3fb950' },
+          { label: 'Moderate Risk', value: healthReady ? stats.moderate : '··', color: '#d29922' },
+          { label: 'Critical',      value: healthReady ? stats.critical : '··', color: '#f85149' },
         ].map(({ label, value, color }) => (
-          <div key={label} style={{
-            background:'#0d1117', border:'1px solid #21262d',
-            borderRadius:8, padding:'14px 16px',
-          }}>
-            <div style={{ fontSize:9, color:'#7d8590', letterSpacing:1.5, textTransform:'uppercase' }}>{label}</div>
-            <div style={{ fontFamily:'Orbitron, monospace', fontSize:28, fontWeight:700, color, marginTop:4 }}>{value}</div>
-          </div>
+          <Card key={label} style={{ position: 'relative', overflow: 'hidden' }}>
+            <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: color }} />
+            <Label>{label}</Label>
+            <div style={{ fontFamily: 'Orbitron, monospace', fontSize: 28, fontWeight: 700, color }}>
+              {value}
+            </div>
+          </Card>
         ))}
       </div>
 
-      {/* Filters */}
-      <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:20, flexWrap:'wrap' }}>
-        <div style={{ display:'flex', gap:8 }}>
-          {FILTER_OPTIONS.map(a => (
-            <button key={a} onClick={() => setFilter(a)}
-              style={{
-                padding:'6px 14px', borderRadius:20, fontSize:11, cursor:'pointer',
-                border: filter===a ? '1px solid #388bfd' : '1px solid #21262d',
-                background: filter===a ? 'rgba(56,139,253,0.15)' : 'transparent',
-                color: filter===a ? '#388bfd' : '#7d8590',
-              }}>
-              {a}
-            </button>
-          ))}
-        </div>
-        <div style={{ marginLeft:'auto', display:'flex', alignItems:'center', gap:8 }}>
-          <span style={{ fontSize:11, color:'#7d8590' }}>Sort by</span>
-          <select value={sort} onChange={e=>setSort(e.target.value)}
+      {/* Filters + sort */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16, alignItems: 'center', flexWrap: 'wrap' }}>
+        {FILTERS.map(f => (
+          <button key={f} onClick={() => setFilter(f)}
             style={{
-              background:'#0d1117', border:'1px solid #21262d', color:'#e6edf3',
-              padding:'4px 10px', borderRadius:6, fontSize:11, cursor:'pointer'
-            }}>
+              padding: '6px 16px', borderRadius: 20, fontSize: 12, cursor: 'pointer',
+              border: filter === f ? `1px solid ${C.accent}` : `1px solid ${C.border}`,
+              background: filter === f ? 'rgba(56,139,253,0.15)' : 'transparent',
+              color: filter === f ? C.accent : C.muted,
+            }}>{f}</button>
+        ))}
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 11, color: C.muted }}>Sort by</span>
+          <select value={sort} onChange={e => setSort(e.target.value)}
+            disabled={!healthReady && sort === 'health'}
+            style={{ background: C.card, border: `1px solid ${C.border}`, color: C.text,
+                     padding: '6px 12px', borderRadius: 8, fontSize: 12, cursor: 'pointer' }}>
             <option value="health">Health (worst first)</option>
+            <option value="airborne">Airborne first</option>
             <option value="airline">Airline</option>
-            <option value="tail">Tail Number</option>
+            <option value="tail">Tail number</option>
           </select>
         </div>
       </div>
 
-      {/* Aircraft grid */}
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(220px, 1fr))', gap:12 }}>
-        {filtered.map(plane => {
-          const health  = plane.health_score || 50
-          const hCol    = healthCol(health)
-          const hBg     = healthBg(health)
-          const isAir   = plane.status === 'airborne'
-          const aColor  = AIRLINE_COLOR[plane.airline] || '#388bfd'
+      {/* Grid */}
+      {shown.length === 0 ? <Empty>No aircraft match this filter.</Empty> : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(230px, 1fr))', gap: 12 }}>
+          {shown.map(plane => {
+            const tail     = plane.tail_number
+            const h        = hOf(tail)
+            const info     = health[tail]
+            const airborne = plane.status === 'airborne'
+            const flightNo = plane.current_flight || plane.callsign
+            const col      = healthCol(h)
+            const airline  = AIRLINE_ALIAS[plane.airline] || plane.airline
 
-          return (
-            <div key={plane.tail_number}
-              onClick={() => navigate(`/pakistan?tail=${plane.tail_number}`)}
-              style={{
-                background: hBg, border: `1px solid ${hCol}33`,
-                borderRadius:10, padding:'16px', cursor:'pointer',
-                transition:'all 0.15s', position:'relative', overflow:'hidden'
-              }}
-              onMouseEnter={e => { e.currentTarget.style.borderColor=hCol; e.currentTarget.style.transform='translateY(-2px)' }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor=`${hCol}33`; e.currentTarget.style.transform='translateY(0)' }}
-            >
-              {/* Airline color bar */}
-              <div style={{ position:'absolute', top:0, left:0, right:0, height:2, background:aColor }} />
-
-              {/* Header row */}
-              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:10 }}>
-                <div>
-                  <div style={{ fontFamily:'Orbitron, monospace', fontSize:13, fontWeight:700, color:'#e6edf3' }}>
-                    {plane.tail_number}
+            return (
+              <div key={tail}
+                onClick={() => navigate('/pakistan', { state: { airline, tail } })}
+                style={{
+                  background: C.card,
+                  border: `1px solid ${C.border}`,
+                  borderTop: `3px solid ${col}`,      // health colour — never overwritten
+                  borderRadius: 12,
+                  padding: '16px 18px',
+                  cursor: 'pointer',
+                  transition: 'box-shadow .15s, transform .15s',
+                }}
+                // Use box-shadow for hover, NOT borderColor — borderColor would
+                // overwrite the coloured top border and erase the health indicator.
+                onMouseEnter={e => {
+                  e.currentTarget.style.boxShadow = `0 0 0 1px ${C.accent}`
+                  e.currentTarget.style.transform = 'translateY(-2px)'
+                }}
+                onMouseLeave={e => {
+                  e.currentTarget.style.boxShadow = 'none'
+                  e.currentTarget.style.transform = 'none'
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 }}>
+                  <div>
+                    <div style={{ fontFamily: 'Orbitron, monospace', fontSize: 15, fontWeight: 700, color: C.text }}>
+                      {tail}
+                    </div>
+                    <div style={{ fontSize: 10, color: C.dim }}>{plane.aircraft_type}</div>
                   </div>
-                  <div style={{ fontSize:10, color:'#7d8590', marginTop:2 }}>
-                    {plane.aircraft_type?.split('-')[0] || '—'}
+                  <span style={{
+                    fontSize: 9, padding: '3px 8px', borderRadius: 20, whiteSpace: 'nowrap',
+                    display: 'inline-flex', alignItems: 'center', gap: 4,
+                    background: airborne ? 'rgba(63,185,80,0.12)' : 'rgba(125,133,144,0.10)',
+                    color: airborne ? '#3fb950' : C.muted,
+                    border: `1px solid ${airborne ? '#3fb95055' : C.border}`,
+                  }}>
+                    <span style={{ width: 5, height: 5, borderRadius: '50%',
+                                   background: airborne ? '#3fb950' : C.muted,
+                                   boxShadow: airborne ? '0 0 5px #3fb950' : 'none' }} />
+                    {airborne ? 'AIRBORNE' : 'GROUND'}
+                  </span>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, marginTop: 10 }}>
+                  <span style={{ fontFamily: 'Orbitron, monospace', fontSize: 30, fontWeight: 700, color: h == null ? C.dim : col }}>
+                    {h == null ? '··' : Math.round(h)}
+                  </span>
+                  <span style={{ fontSize: 11, color: C.dim }}>/ 100</span>
+                  {info && (
+                    <span style={{ marginLeft: 'auto', fontSize: 10, color: riskCol(info.risk) }}>
+                      {info.risk}
+                    </span>
+                  )}
+                </div>
+
+                <div style={{ height: 4, background: C.border, borderRadius: 2, marginTop: 8, overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${h ?? 0}%`, background: col,
+                                borderRadius: 2, transition: 'width .6s ease' }} />
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                              marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
+                  <span style={{ fontSize: 10, fontFamily: 'Orbitron, monospace',
+                                 color: airborne && flightNo ? '#3fb950' : C.dim }}>
+                    {airborne && flightNo ? `✈ ${toIATA(flightNo)}` : '—'}
+                  </span>
+                  <span style={{ fontSize: 10, color: AIRLINE_COLOR[airline] || C.muted }}>
+                    {airline}
+                  </span>
+                </div>
+
+                {info && (
+                  <div style={{ fontSize: 10, color: C.dim, marginTop: 5 }}>
+                    RUL {info.rul} cycles
                   </div>
-                </div>
-                <div style={{
-                  fontSize:9, padding:'3px 8px', borderRadius:20,
-                  background: isAir ? 'rgba(63,185,80,0.15)' : 'rgba(125,133,144,0.15)',
-                  color: isAir ? '#3fb950' : '#7d8590',
-                  border: `1px solid ${isAir ? '#3fb950' : '#7d8590'}44`,
-                }}>
-                  {isAir ? '● AIRBORNE' : '○ GROUND'}
-                </div>
+                )}
               </div>
-
-              {/* Health score */}
-              <div style={{ display:'flex', alignItems:'baseline', gap:6, marginBottom:8 }}>
-                <div style={{ fontFamily:'Orbitron, monospace', fontSize:32, fontWeight:700, color:hCol }}>
-                  {Math.round(health)}
-                </div>
-                <div style={{ fontSize:11, color:'#7d8590' }}>/ 100</div>
-              </div>
-
-              {/* Health bar */}
-              <div style={{ height:3, background:'#21262d', borderRadius:2, marginBottom:10 }}>
-                <div style={{ height:'100%', width:`${health}%`, background:hCol, borderRadius:2 }} />
-              </div>
-
-              {/* Callsign + airline */}
-              <div style={{ display:'flex', justifyContent:'space-between', fontSize:10, color:'#484f58' }}>
-                <span>{plane.callsign && plane.callsign !== 'Grounded' ? plane.callsign : '—'}</span>
-                <span style={{ color:aColor }}>{AIRLINE_SHORT[plane.airline] || plane.airline}</span>
-              </div>
-            </div>
-          )
-        })}
-      </div>
-
-      {filtered.length === 0 && (
-        <div style={{ textAlign:'center', padding:'60px 0', color:'#484f58', fontSize:13 }}>
-          No aircraft found for this filter.
+            )
+          })}
         </div>
       )}
-    </div>
+
+      <div style={{ fontSize: 11, color: C.dim, marginTop: 18 }}>
+        Health and Remaining Useful Life are predicted per aircraft from its accumulated engine cycles.
+        Airborne status and flight numbers come from live ADS-B, matched to each airframe by its ICAO24 hex code.
+      </div>
+    </Page>
   )
 }

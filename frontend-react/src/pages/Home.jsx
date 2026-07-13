@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getPakFleet, analyzePak, getFleetStatus, getWeather, AIRLINE_ALIAS, toIATA } from '../api'
+import { getPakFleet, getFleetHealth, getFleetStatus, getWeather, AIRLINE_ALIAS, toIATA } from '../api'
+import RecomputeButton from '../components/RecomputeButton'
 
 const Card = ({ children, style = {}, onClick, onMouseEnter, onMouseLeave }) => (
   <div onClick={onClick} onMouseEnter={onMouseEnter} onMouseLeave={onMouseLeave}
@@ -43,24 +44,22 @@ export default function Home() {
     return () => clearInterval(clock)
   }, [])
 
-  // Then scan each aircraft for its REAL health (background, progressive)
+  // Real health for every aircraft in ONE cached call.
+  // (Previously this fired 44 separate requests, each running an LSTM inference.)
+  const applyHealth = (arr) => {
+    const acc = {}
+    for (const a of arr || []) {
+      if (a.health_score != null) acc[a.tail_number] = a.health_score
+    }
+    setHealth(acc)
+    setScanPct(100)
+  }
+
   useEffect(() => {
-    if (!fleet.length) return
-    let cancelled = false
-    ;(async () => {
-      const acc = {}
-      for (let i = 0; i < fleet.length; i++) {
-        if (cancelled) return
-        try {
-          const r = await analyzePak(fleet[i].tail_number)
-          acc[fleet[i].tail_number] = r.data.health_score
-          setHealth({ ...acc })
-        } catch { /* skip */ }
-        setScanPct(Math.round(((i + 1) / fleet.length) * 100))
-      }
-    })()
-    return () => { cancelled = true }
-  }, [fleet])
+    getFleetHealth()
+      .then(r => applyHealth(r.data.fleet))
+      .catch(() => setScanPct(100))
+  }, [])
 
   // Helper: real health for a plane if scanned, else null
   const planeHealth = (tail) => (tail in health ? health[tail] : null)
@@ -97,12 +96,15 @@ export default function Home() {
           <div style={{ fontSize:10, color:'#484f58', letterSpacing:3, textTransform:'uppercase', marginBottom:4 }}>Pakistan Digital Fleet</div>
           <div style={{ fontFamily:'Orbitron, monospace', fontSize:28, fontWeight:900, color:'#e6edf3' }}>Fleet Command Center</div>
         </div>
-        <div style={{ textAlign:'right' }}>
-          <div style={{ fontFamily:'Orbitron, monospace', fontSize:20, fontWeight:700, color:'#388bfd' }}>
-            {time.toLocaleTimeString('en-PK',{timeZone:'Asia/Karachi',hour12:false})}
-          </div>
-          <div style={{ fontSize:11, color:'#7d8590', marginTop:2 }}>
-            PKT · {scanning ? `Analyzing fleet ${scanPct}%` : 'Live'}
+        <div style={{ display:'flex', alignItems:'flex-start', gap:16 }}>
+          <RecomputeButton onDone={applyHealth} />
+          <div style={{ textAlign:'right' }}>
+            <div style={{ fontFamily:'Orbitron, monospace', fontSize:20, fontWeight:700, color:'#388bfd' }}>
+              {time.toLocaleTimeString('en-PK',{timeZone:'Asia/Karachi',hour12:false})}
+            </div>
+            <div style={{ fontSize:11, color:'#7d8590', marginTop:2 }}>
+              PKT · {scanning ? 'Analyzing…' : 'Live'}
+            </div>
           </div>
         </div>
       </div>

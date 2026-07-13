@@ -12,6 +12,8 @@ export const getHistory      = (tail)  => api.get(`/history/${tail}`)
 
 // ── Pakistan Fleet ──
 export const getPakFleet     = ()      => api.get('/pak_fleet')
+export const getFleetHealth  = ()      => api.get('/fleet_health')
+export const recomputeFleetHealth = () => api.get('/fleet_health?refresh=true', { timeout: 120000 })
 export const analyzePak      = (tail)  => api.get(`/pak_analyze/${tail}`)
 export const getPakRoute     = (tail)  => api.get(`/pak_route/${tail}`)
 export const getPakHistory   = (tail)  => api.get(`/pak_history/${tail}`)
