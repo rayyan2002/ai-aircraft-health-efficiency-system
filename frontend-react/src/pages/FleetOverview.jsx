@@ -1,15 +1,9 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getPakFleet, getFleetHealth, AIRLINE_ALIAS, toIATA } from '../api'
+import { getPakFleet, getFleetHealth, AIRLINE_ALIAS, AIRLINE_COLOR, toIATA } from '../api'
 import { Page, Card, Label, Badge, Empty, Spinner, C } from '../components/ui'
 import RecomputeButton from '../components/RecomputeButton'
 
-const AIRLINE_COLOR = {
-  'PIA':       '#388bfd',
-  'AirBlue':   '#3fb950',
-  'AirSial':   '#d29922',
-  'FlyJinnah': '#f85149',
-}
 const FILTERS = ['All', 'PIA', 'AirBlue', 'AirSial', 'FlyJinnah']
 
 export default function FleetOverview() {

@@ -42,7 +42,10 @@ export default function CO2Dashboard() {
   const totalTrees = Math.round(totalCO2 * 1000 / 21) // ~21kg CO2 absorbed per tree/year
   const avgPerAircraft = fleet.length ? Math.round(totalCO2 / fleet.length) : 0
 
-  const pieColors = { PIA: '#388bfd', AirBlue: '#3fb950', AirSial: '#d29922', FlyJinnah: '#f85149' }
+  // Use the SHARED airline colour map (api/index.js) — not a local copy.
+  // A local copy is how the same airline ends up a different colour on
+  // different pages.
+  const colorFor = (al) => AIRLINE_COLOR[al] || C.accent
 
   return (
     <Page eyebrow="Environmental, Social & Governance" title="CO₂ ESG Dashboard"
@@ -65,7 +68,7 @@ export default function CO2Dashboard() {
                 <YAxis tick={{ fill: C.muted, fontSize: 11 }} axisLine={{ stroke: C.border }} />
                 <Tooltip contentStyle={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text }} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
                 <RBar dataKey="co2" radius={[6, 6, 0, 0]}>
-                  {airlineData.map((a, i) => <Cell key={i} fill={pieColors[a.airline] || C.accent} />)}
+                  {airlineData.map((a, i) => <Cell key={i} fill={colorFor(a.airline)} />)}
                 </RBar>
               </BarChart>
             </ResponsiveContainer>
@@ -77,7 +80,7 @@ export default function CO2Dashboard() {
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
                 <Pie data={airlineData} dataKey="co2" nameKey="airline" cx="50%" cy="50%" outerRadius={90} innerRadius={50}>
-                  {airlineData.map((a, i) => <Cell key={i} fill={pieColors[a.airline] || C.accent} />)}
+                  {airlineData.map((a, i) => <Cell key={i} fill={colorFor(a.airline)} />)}
                 </Pie>
                 <Legend wrapperStyle={{ fontSize: 11, color: C.muted }} />
                 <Tooltip contentStyle={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text }} />
@@ -90,11 +93,11 @@ export default function CO2Dashboard() {
       <Card>
         <Label>Per-Airline Breakdown</Label>
         <div style={{ marginTop: 8 }}>
-          {airlineData.sort((a, b) => b.co2 - a.co2).map(a => (
+          {[...airlineData].sort((a, b) => b.co2 - a.co2).map(a => (
             <div key={a.airline} style={{ display: 'grid', gridTemplateColumns: '120px 1fr 120px', alignItems: 'center', gap: 12, padding: '8px 0', borderBottom: `1px solid ${C.border}` }}>
-              <span style={{ fontSize: 13, color: pieColors[a.airline] || C.text, fontWeight: 500 }}>{a.airline}</span>
+              <span style={{ fontSize: 13, color: colorFor(a.airline), fontWeight: 500 }}>{a.airline}</span>
               <div style={{ height: 8, background: C.border, borderRadius: 4, overflow: 'hidden' }}>
-                <div style={{ height: '100%', width: `${(a.co2 / totalCO2) * 100}%`, background: pieColors[a.airline] || C.accent, borderRadius: 4 }} />
+                <div style={{ height: '100%', width: `${(a.co2 / totalCO2) * 100}%`, background: colorFor(a.airline), borderRadius: 4 }} />
               </div>
               <span style={{ fontSize: 12, color: C.muted, textAlign: 'right' }}>{a.co2.toLocaleString()} t · {a.count} ac</span>
             </div>

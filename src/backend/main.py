@@ -1523,6 +1523,33 @@ def get_raw_conn():
     return conn
 
 
+def _apply_maintenance_override(tail_number, health_score, predicted_rul, risk_level):
+    """
+    If an aircraft was maintained within the last 72 hours, its health baseline
+    is reset. THIS IS SHARED so /api/pak_analyze and /api/fleet_health cannot
+    disagree — they previously did, which meant a maintenance reset showed up on
+    the Pakistan Fleet page but not on Fleet Overview.
+
+    Returns (health_score, predicted_rul, risk_level), possibly overridden.
+    """
+    try:
+        _conn = get_raw_conn()
+        last_maint = _conn.execute("""
+            SELECT performed_at FROM maintenance_records
+            WHERE tail_number = ?
+            ORDER BY performed_at DESC LIMIT 1
+        """, (tail_number,)).fetchone()
+        _conn.close()
+        if last_maint and last_maint[0]:
+            maint_time  = _datetime.fromisoformat(last_maint[0])
+            hours_since = (_datetime.now() - maint_time).total_seconds() / 3600
+            if hours_since < 72:
+                return 100.0, 200.0, "Low"
+    except Exception:
+        pass
+    return health_score, predicted_rul, risk_level
+
+
 # ── Fleet health cache ────────────────────────────────────────────────
 # Health/RUL are derived from each aircraft's accumulated engine cycles, which
 # do NOT change during a session. Recomputing them on every page load meant 44
@@ -1589,13 +1616,23 @@ def get_fleet_health(refresh: bool = False):
                 health = round(min(100, max(0, (rul - 5) / (123 - 5) * 100)), 1)
                 risk = "High" if rul < 20 else "Moderate" if rul < 50 else "Low"
 
+                # Apply the SAME maintenance override that /api/pak_analyze uses.
+                # Without this, logging maintenance reset the aircraft on the
+                # Pakistan Fleet page but Fleet Overview kept showing old health.
+                health, rul, risk = _apply_maintenance_override(tail, health, rul, risk)
+
                 entry = {
                     "health_score":         health,
                     "predicted_rul_cycles": round(rul, 1),
                     "risk_level":           risk,
                     "total_cycles":         cycles,
                 }
-                _FLEET_HEALTH_CACHE[tail] = entry
+                # NOTE: we deliberately do NOT cache a maintenance-overridden
+                # value — the override expires 72 hours after the maintenance,
+                # and a cached 100 would outlive it. Only cache the pure
+                # cycle-derived result.
+                if health < 100.0:
+                    _FLEET_HEALTH_CACHE[tail] = entry
                 computed += 1
             except Exception as e:
                 print(f"⚠️ fleet_health failed for {tail}: {e}")
@@ -1858,25 +1895,10 @@ def analyze_pakistan_aircraft(tail_number: str):
     health_score = round(min(100, max(0, (predicted_rul - 5) / (123 - 5) * 100)), 1)
     shap_values  = compute_dynamic_shap(alt, speed, if_score, predicted_rul)
 
-    # ── Maintenance override: if maintained within 72 hours → reset health ──
-    try:
-        _conn = get_raw_conn()
-        last_maint = _conn.execute("""
-            SELECT performed_at FROM maintenance_records
-            WHERE tail_number = ?
-            ORDER BY performed_at DESC LIMIT 1
-        """, (tail_number,)).fetchone()
-        _conn.close()
-        if last_maint:
-            from datetime import datetime as _dt2
-            maint_time   = _dt2.fromisoformat(last_maint[0])
-            hours_since  = (_dt2.now() - maint_time).total_seconds() / 3600
-            if hours_since < 72:
-                health_score  = 100.0
-                predicted_rul = 200.0
-                risk_level    = "Low"
-    except:
-        pass
+    # ── Maintenance override (shared with /api/fleet_health) ──
+    health_score, predicted_rul, risk_level = _apply_maintenance_override(
+        tail_number, health_score, predicted_rul, risk_level
+    )
 
     return {
         "tail":                 tail_number,

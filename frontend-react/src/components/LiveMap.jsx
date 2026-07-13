@@ -7,24 +7,39 @@ import { C } from './ui'
 // ── Aircraft icon: a real plane silhouette, rotated to its heading ──
 // Visibility is the priority: a dark halo sits behind a bright fill so the
 // aircraft reads clearly against both dark and light tiles.
-function planeIcon({ heading = 0, color = '#58a6ff', size = 28, selected = false, dark = true }) {
+function planeIcon({ heading = 0, color = '#58a6ff', size = 28, selected = false,
+                    dark = true, inFleet = false, anomaly = false }) {
   const PATH = 'M12 2 L13.6 9.4 L22 12.2 L22 14 L13.6 12.6 L13.2 19 L15.8 20.6 L15.8 22 L12 21 L8.2 22 L8.2 20.6 L10.8 19 L10.4 12.6 L2 14 L2 12.2 L10.4 9.4 Z'
-  // halo = thick outline in the opposite tone, so the plane never blends in
   const halo = dark ? 'rgba(0,0,0,0.85)' : 'rgba(255,255,255,0.95)'
+
+  // COLOUR always means ALTITUDE — never anything else.
+  // Membership and anomaly are shown by RING, not colour, so the two meanings
+  // can never be confused with each other.
+  //   white ring   -> in our tracked fleet
+  //   magenta ring -> anomaly flagged (pulses)
+  const ringColor = anomaly ? '#ff2bd1' : inFleet ? '#ffffff' : null
+  const ring = ringColor
+    ? `<circle cx="12" cy="12" r="11" fill="none" stroke="${ringColor}"
+               stroke-width="${anomaly ? 2.2 : 1.6}"
+               ${anomaly ? 'stroke-dasharray="3 2"' : ''} opacity="0.95"/>`
+    : ''
+
   const glow = selected
     ? `drop-shadow(0 0 7px ${color}) drop-shadow(0 0 14px ${color})`
-    : `drop-shadow(0 0 3px ${halo})`
+    : anomaly
+      ? 'drop-shadow(0 0 6px #ff2bd1)'
+      : `drop-shadow(0 0 3px ${halo})`
 
   const svg = `
     <svg viewBox="0 0 24 24" width="${size}" height="${size}"
-         style="transform: rotate(${heading}deg); filter:${glow};
+         style="filter:${glow};">
+      <g style="transform: rotate(${heading}deg); transform-origin: 12px 12px;
                 transition: transform .45s linear;">
-      <!-- halo layer -->
-      <path d="${PATH}" fill="none" stroke="${halo}" stroke-width="4"
-            stroke-linejoin="round"/>
-      <!-- bright body -->
-      <path d="${PATH}" fill="${color}" stroke="${selected ? '#ffffff' : halo}"
-            stroke-width="${selected ? 1.4 : 0.8}" stroke-linejoin="round"/>
+        <path d="${PATH}" fill="none" stroke="${halo}" stroke-width="4" stroke-linejoin="round"/>
+        <path d="${PATH}" fill="${color}" stroke="${selected ? '#ffffff' : halo}"
+              stroke-width="${selected ? 1.4 : 0.8}" stroke-linejoin="round"/>
+      </g>
+      ${ring}
     </svg>`
 
   return L.divIcon({
@@ -103,37 +118,40 @@ export default function LiveMap({
         </button>
       </div>
 
-      {/* Legend */}
+      {/* Legend — colour = altitude, ring = what the aircraft IS */}
       <div style={{
         position: 'absolute', bottom: 10, left: 10, zIndex: 1000,
         background: 'rgba(6,8,16,.92)', border: `1px solid ${C.border}`,
         borderRadius: 8, padding: '9px 12px', backdropFilter: 'blur(8px)',
       }}>
-        <div style={{ fontSize: 9, color: C.muted, letterSpacing: 1, textTransform: 'uppercase', marginBottom: 5 }}>
-          Legend
+        <div style={{ fontSize: 9, color: C.muted, letterSpacing: 1, textTransform: 'uppercase', marginBottom: 4 }}>
+          Colour = altitude
         </div>
-        {[['#4ade80', 'Tracked fleet'], ['#ff5a52', 'Anomaly flagged']].map(([col, lbl]) => (
-          <div key={lbl} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
-            <span style={{ width: 9, height: 9, background: col, borderRadius: 2,
-                           boxShadow: `0 0 5px ${col}` }} />
-            <span style={{ fontSize: 10, color: C.text }}>{lbl}</span>
+        {[['#58a6ff', '10 km+'], ['#4ade80', '6–10 km'],
+          ['#ffc233', '2–6 km'], ['#ff6b64', 'below 2 km']].map(([col, lbl]) => (
+          <div key={lbl} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+            <span style={{ width: 8, height: 8, background: col, borderRadius: 2 }} />
+            <span style={{ fontSize: 10, color: C.muted }}>{lbl}</span>
           </div>
         ))}
-        <div style={{ marginTop: 5, paddingTop: 5, borderTop: `1px solid ${C.border}` }}>
-          <div style={{ fontSize: 9, color: C.muted, marginBottom: 3 }}>Others by altitude</div>
-          {[['#58a6ff', '10 km+'], ['#4ade80', '6–10 km'],
-            ['#ffc233', '2–6 km'], ['#ff6b64', '< 2 km']].map(([col, lbl]) => (
-            <div key={lbl} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
-              <span style={{ width: 8, height: 8, background: col, borderRadius: 2 }} />
-              <span style={{ fontSize: 10, color: C.muted }}>{lbl}</span>
-            </div>
-          ))}
+
+        <div style={{ fontSize: 9, color: C.muted, letterSpacing: 1, textTransform: 'uppercase',
+                      marginTop: 7, paddingTop: 6, borderTop: `1px solid ${C.border}`, marginBottom: 4 }}>
+          Ring = aircraft
         </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+          <span style={{ width: 10, height: 10, borderRadius: '50%', border: '1.6px solid #ffffff' }} />
+          <span style={{ fontSize: 10, color: C.text }}>Tracked fleet</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 10, height: 10, borderRadius: '50%',
+                         border: '2px dashed #ff2bd1', boxShadow: '0 0 5px #ff2bd1' }} />
+          <span style={{ fontSize: 10, color: '#ff2bd1' }}>Anomaly flagged</span>
+        </div>
+
         <div style={{ marginTop: 6, paddingTop: 5, borderTop: `1px solid ${C.border}`,
                       fontSize: 10, color: C.text }}>
-          {aircraft.length} aircraft · <span style={{ color: '#4ade80' }}>
-            {aircraft.filter(a => a.in_fleet).length} in fleet
-          </span>
+          {aircraft.length} aircraft · {aircraft.filter(a => a.in_fleet).length} in fleet
         </div>
       </div>
 
@@ -160,9 +178,9 @@ export default function LiveMap({
           if (a.lat == null || a.lon == null) return null
           const isSel  = a.callsign === selected
           const dimmed = onlyFleet && !a.in_fleet
-          const color  = a.anomaly ? '#ff5a52'          // bright red
-                        : a.in_fleet ? '#4ade80'        // bright green — our fleet
-                        : altColor(a.altitude)
+          // Colour ALWAYS encodes altitude. Fleet membership and anomaly are
+          // shown by a RING, so a green aircraft never means two things at once.
+          const color  = altColor(a.altitude)
 
           return (
             <Marker
@@ -175,6 +193,8 @@ export default function LiveMap({
                 size: isSel ? 38 : a.in_fleet ? 31 : 24,
                 selected: isSel,
                 dark,
+                inFleet: a.in_fleet,
+                anomaly: a.anomaly,
               })}
               eventHandlers={{ click: () => onSelect(a.callsign) }}
             >
