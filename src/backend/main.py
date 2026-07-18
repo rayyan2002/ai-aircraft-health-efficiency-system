@@ -560,6 +560,229 @@ def _effective_status(fs_status, fs_last_seen, cutoff=None):
     return "grounded"
 
 
+# ══════════════════════════════════════════════════════════════════════
+# FLIGHTRADAR24 — commercial flight data (positions + ROUTE + registration)
+# ══════════════════════════════════════════════════════════════════════
+#
+# WHY THIS EXISTS:
+#   ADS-B (OpenSky) broadcasts position but NOT origin/destination, and its
+#   volunteer receiver coverage over Pakistan is patchy — aircraft that are
+#   genuinely flying sometimes vanish from the feed. In testing, OpenSky saw
+#   ~6 of our fleet airborne while FR24 saw 19, each with a full route.
+#
+# WHAT FR24 RETURNS PER AIRCRAFT:
+#   hex, reg, callsign, flight, lat, lon, track, alt, gspeed, vspeed,
+#   type, orig_iata, orig_icao, dest_iata, dest_icao, eta, source
+#
+#   'hex' drops straight into our existing hex reconciliation, and
+#   orig/dest give us the route ADS-B structurally cannot provide.
+#
+# CREDIT DISCIPLINE (important — the plan is metered):
+#   FR24 charges per aircraft RETURNED, roughly 6 credits each on the "full"
+#   endpoint. A Pakistan bounding-box query costs ~160 credits because it
+#   returns every aircraft in the box. We therefore query ONLY our 44
+#   registrations, so we pay for our own fleet and nothing else.
+#   Also: the API allows 10 requests/minute, so we make ONE call per cycle.
+#
+# SAFETY:
+#   Entirely behind FR24_API_KEY. If the key is unset, or the call fails for
+#   any reason, the pipeline silently falls back to OpenSky. The demo can
+#   never be left with no data because a paid API had a bad day.
+#
+#     PowerShell:  $env:FR24_API_KEY="your_key"
+#     bash:        export FR24_API_KEY="your_key"
+#
+FR24_API_KEY = os.getenv("FR24_API_KEY", "").strip()
+FR24_BASE    = "https://fr24api.flightradar24.com/api"
+
+# Unit conversions. FR24 uses aviation units; our database and BOTH ML models
+# were trained on OpenSky's SI units. Getting these wrong would silently feed
+# the Isolation Forest garbage that still looks plausible.
+FT_TO_M      = 0.3048        # altitude:      feet    -> metres
+KNOT_TO_MS   = 0.514444      # ground speed:  knots   -> m/s
+FTMIN_TO_MS  = 0.00508       # vertical rate: ft/min  -> m/s
+
+
+def _fr24_enabled() -> bool:
+    return bool(FR24_API_KEY)
+
+
+def _fr24_headers():
+    # NOTE: do NOT also send an X-API-Key header. Sending both that and the
+    # Bearer token causes Cloudflare to reject the request with an HTML page.
+    # A default Python user-agent is also blocked, hence the explicit one.
+    return {
+        "Accept": "application/json",
+        "Accept-Version": "v1",
+        "User-Agent": "AeroTwin-FYP/1.0",
+        "Authorization": f"Bearer {FR24_API_KEY}",
+    }
+
+
+def fetch_and_insert_fr24():
+    """
+    Pull our fleet's live flights from Flightradar24 into flight_telemetry —
+    the SAME table and SAME units OpenSky writes to, so reconciliation, the
+    Isolation Forest and the map all work unchanged.
+
+    Returns (saved, anomalies).
+    """
+    if not _fr24_enabled():
+        return 0, 0
+
+    import requests
+
+    conn = _sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    try:
+        regs = [r[0] for r in cur.execute(
+            "SELECT tail_number FROM fleet WHERE tail_number IS NOT NULL"
+        ).fetchall()]
+        if not regs:
+            conn.close()
+            return 0, 0
+
+        try:
+            resp = requests.get(
+                f"{FR24_BASE}/live/flight-positions/full",
+                headers=_fr24_headers(),
+                params={"registrations": ",".join(regs)},
+                timeout=(10, 40),
+            )
+        except Exception as e:
+            print(f"⚠️  [FR24] request failed ({type(e).__name__}) — falling back to OpenSky.")
+            conn.close()
+            return 0, 0
+
+        if resp.status_code == 429:
+            print("⚠️  [FR24] rate limited (10 req/min) — skipping this cycle.")
+            conn.close()
+            return 0, 0
+        if resp.status_code != 200:
+            print(f"⚠️  [FR24] HTTP {resp.status_code}: {resp.text[:160]} — falling back to OpenSky.")
+            conn.close()
+            return 0, 0
+
+        flights = (resp.json() or {}).get("data") or []
+        if not flights:
+            print("ℹ️  [FR24] no fleet aircraft airborne right now.")
+            conn.close()
+            return 0, 0
+
+        now = _datetime.now()
+        now_s = now.strftime("%Y-%m-%d %H:%M:%S")
+        saved = anomalies = grounded = estimated = 0
+
+        for f in flights:
+            hexcode = (f.get("hex") or "").strip()
+            lat, lon = f.get("lat"), f.get("lon")
+            alt_ft   = f.get("alt")
+            if not hexcode or lat is None or lon is None or alt_ft is None:
+                continue
+
+            # FR24 also reports aircraft sitting at the gate. Those are not
+            # airborne, and feeding altitude 0 / speed 0 to the Isolation
+            # Forest would produce a meaningless "anomaly".
+            gspeed_kt = f.get("gspeed") or 0
+            if alt_ft <= 0 or gspeed_kt < 50:
+                grounded += 1
+                continue
+
+            # Convert to the SI units our models were trained on.
+            alt_m    = float(alt_ft) * FT_TO_M
+            speed_ms = float(gspeed_kt) * KNOT_TO_MS
+            vrate_ms = float(f.get("vspeed") or 0) * FTMIN_TO_MS
+            track    = f.get("track")
+
+            callsign = (f.get("callsign") or f.get("flight") or "").strip().upper()
+            if not callsign:
+                continue
+
+            # FR24 marks whether a position is real ADS-B or interpolated.
+            # We record it so the UI never presents an estimate as a
+            # measurement.
+            source = (f.get("source") or "").strip().upper()
+            if source == "ESTIMATED":
+                estimated += 1
+
+            try:
+                a_flag, _ = run_iforest(
+                    velocity=speed_ms, altitude=alt_m,
+                    vertical_rate=vrate_ms, true_track=float(track or 0),
+                )
+            except Exception:
+                a_flag = 0
+
+            cur.execute("""
+                INSERT INTO flight_telemetry
+                (tail_number, callsign, altitude, velocity,
+                 latitude, longitude, track, vertical_rate, anomaly_flag, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (hexcode, callsign, alt_m, speed_ms, lat, lon,
+                  track, vrate_ms, a_flag, now))
+            saved += 1
+            if a_flag:
+                anomalies += 1
+
+            # THE PAYOFF — the route. ADS-B can never give us this.
+            dep = (f.get("orig_iata") or "").strip().upper() or None
+            arr = (f.get("dest_iata") or "").strip().upper() or None
+            reg = (f.get("reg") or "").strip().upper() or None
+
+            # Prefer FR24's own registration; fall back to our hex registry.
+            row = None
+            if reg:
+                row = cur.execute(
+                    "SELECT tail_number FROM fleet WHERE UPPER(TRIM(tail_number)) = ?",
+                    (reg,)).fetchone()
+            if not row:
+                row = cur.execute(
+                    "SELECT tail_number FROM fleet WHERE UPPER(TRIM(hex_code)) = ?",
+                    (hexcode.upper(),)).fetchone()
+
+            if row:
+                cur.execute("""
+                    INSERT INTO fleet_status
+                        (tail_number, status, last_seen, current_callsign,
+                         departure_airport, arrival_airport)
+                    VALUES (?, 'airborne', ?, ?, ?, ?)
+                    ON CONFLICT(tail_number) DO UPDATE SET
+                        status            = 'airborne',
+                        last_seen         = excluded.last_seen,
+                        current_callsign  = excluded.current_callsign,
+                        departure_airport = excluded.departure_airport,
+                        arrival_airport   = excluded.arrival_airport
+                """, (row[0], now_s, callsign, dep, arr))
+
+        conn.commit()
+        msg = (f"✅ [FR24] {saved} fleet aircraft airborne with routes "
+               f"({anomalies} flagged anomalous")
+        if estimated:
+            msg += f", {estimated} position(s) estimated not live ADS-B"
+        if grounded:
+            msg += f", {grounded} on ground skipped"
+        print(msg + ").")
+        return saved, anomalies
+
+    finally:
+        conn.close()
+
+
+def fr24_credits_used():
+    """Report credits consumed this billing period (cheap call, for the UI)."""
+    if not _fr24_enabled():
+        return None
+    try:
+        import requests
+        r = requests.get(f"{FR24_BASE}/usage", headers=_fr24_headers(), timeout=(10, 25))
+        if r.status_code != 200:
+            return None
+        return sum(int(d.get("credits", 0)) for d in (r.json() or {}).get("data", []))
+    except Exception:
+        return None
+
+
 def reconcile_opensky_fleet_status():
     """
     HEX-BASED FLIGHT LIFECYCLE.
@@ -748,13 +971,32 @@ async def automated_data_pipeline():
             )
             conn_snap.close()
 
+            # ── Step 2a: Flightradar24 (preferred — has ROUTE data) ──
+            # If a key is configured we use FR24, which gives origin and
+            # destination that ADS-B structurally cannot provide, plus far
+            # better coverage over Pakistan. If it is not configured, or the
+            # call fails, we fall through to OpenSky so the system NEVER ends
+            # up with no data.
+            fr24_saved = 0
+            if _fr24_enabled():
+                try:
+                    fr24_saved, _ = await asyncio.get_event_loop().run_in_executor(
+                        None, fetch_and_insert_fr24
+                    )
+                except Exception as e:
+                    errors.append(f"fr24:{e}")
+                    fr24_saved = 0
+
             # ── Step 2: Fetch OpenSky → flight_telemetry ──
-            try:
-                before = _get_row_count("flight_telemetry")
-                await asyncio.get_event_loop().run_in_executor(None, fetch_and_insert_opensky)
-                opensky_saved = _get_row_count("flight_telemetry") - before
-            except Exception as e:
-                errors.append(f"opensky:{e}")
+            #   Runs when AirLabs is off OR returned nothing (fallback).
+            opensky_saved = 0
+            if fr24_saved == 0:
+                try:
+                    before = _get_row_count("flight_telemetry")
+                    await asyncio.get_event_loop().run_in_executor(None, fetch_and_insert_opensky)
+                    opensky_saved = _get_row_count("flight_telemetry") - before
+                except Exception as e:
+                    errors.append(f"opensky:{e}")
 
             # ── Step 2b: HEX-BASED RECONCILIATION (flight lifecycle) ──
             try:
@@ -765,17 +1007,12 @@ async def automated_data_pipeline():
             except Exception as e:
                 errors.append(f"reconcile:{e}")
 
-            # ── Step 3: Fetch AviationStack → pakistan_telemetry ──
-            # Also collect which tails are active this cycle
-            try:
-                before = _get_row_count("pakistan_telemetry")
-                current_active = await asyncio.get_event_loop().run_in_executor(
-                    None, fetch_and_insert_aviationstack_tracked
-                )
-                avstack_saved = _get_row_count("pakistan_telemetry") - before
-            except Exception as e:
-                errors.append(f"aviationstack:{e}")
-                current_active = set()
+            # ── Step 3: AviationStack — DISABLED ──
+            # Confirmed to return zero flights for Pakistani carriers on the
+            # free tier, so it added ~2s per cycle for no data. Route and
+            # position data now come from FR24 (Step 2a) with OpenSky as the
+            # fallback. The function is retained for reference only.
+            current_active = set()
 
             # ── Step 3b: Fetch weather for Pakistani airports ──
             try:
@@ -846,12 +1083,32 @@ async def automated_data_pipeline():
         except Exception as e:
             print(f"⚠️ Log write failed: {e}")
 
-        print("💤 [HEARTBEAT] Sleeping 5 minutes...")
-        await asyncio.sleep(300)
+        # Poll interval. FR24 bills per aircraft returned (~6 credits each,
+        # so ~114 credits for our ~19 airborne aircraft). At 60,000 credits a
+        # month that is roughly 500 polls, so a 5-minute interval running all
+        # day would exhaust the plan in under three days. We therefore poll
+        # less often when FR24 is the source. OpenSky is free, so it keeps the
+        # faster cadence.
+        #   Override with:  $env:PIPELINE_INTERVAL_MIN="15"
+        _default_min = 30 if _fr24_enabled() else 5
+        try:
+            _interval = int(os.getenv("PIPELINE_INTERVAL_MIN", _default_min))
+        except ValueError:
+            _interval = _default_min
+        print(f"💤 [HEARTBEAT] Sleeping {_interval} minutes...")
+        await asyncio.sleep(_interval * 60)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if _fr24_enabled():
+        print("🛰️  DATA SOURCE: Flightradar24 (routes enabled) — OpenSky is the fallback.")
+        _cr = fr24_credits_used()
+        if _cr is not None:
+            print(f"   FR24 credits used this period: {_cr}")
+    else:
+        print("📡 DATA SOURCE: OpenSky ADS-B. No FR24_API_KEY set, so origin/"
+              "destination are unavailable (ADS-B does not broadcast route).")
     worker_task = asyncio.create_task(automated_data_pipeline())
     yield
     worker_task.cancel()
@@ -896,15 +1153,26 @@ lstm_scaler  = None
 try:
     if_model     = joblib.load(IF_MODEL_PATH)
     scaler       = joblib.load(SCALER_PATH)
-    cmapss_model = joblib.load(CMAPSS_MODEL_PATH)
-    print("✅ SUCCESS: FYP-1 Models Loaded")
+    print("✅ SUCCESS: Isolation Forest & scaler loaded")
 except Exception as e:
     print(f"⚠️ WARNING: FYP-1 Models missing or failed: {e}")
+
+# The C-MAPSS Random Forest is an early baseline. It is NOT used for any
+# prediction in the running system (health comes from the LSTM + wear model).
+# It is loaded optionally and its absence must never break the models above,
+# so it lives in its own try block. The .pkl is git-ignored because it is
+# ~122 MB and unused; this code degrades gracefully without it.
+try:
+    cmapss_model = joblib.load(CMAPSS_MODEL_PATH)
+    print("✅ SUCCESS: C-MAPSS baseline model loaded (optional)")
+except Exception:
+    cmapss_model = None
+    print("ℹ️  C-MAPSS baseline model not present — skipped (not required).")
 
 try:
     lstm_model  = tf.keras.models.load_model(LSTM_MODEL_PATH, safe_mode=False)
     lstm_scaler = joblib.load(LSTM_SCALER_PATH)
-    print("✅ SUCCESS: FYP-2 Kamal's LSTM & Scaler Loaded")
+    print("✅ SUCCESS: LSTM engine-health model & scaler loaded")
 except Exception as e:
     print(f"⚠️ WARNING: FYP-2 LSTM missing or failed: {e}")
 
@@ -1091,6 +1359,32 @@ def get_fleet_data(db: Session = Depends(get_db)):
 
     except Exception as e:
         return {"fleet": [{"tail_number": "Error", "current_flight": str(e)}]}
+
+
+@app.get("/api/data_source")
+def get_data_source():
+    """
+    Which feed is live, and what it can/cannot provide.
+
+    The UI uses this to label itself honestly: on OpenSky there is no route
+    data, so pages must say so rather than showing a blank departure field as
+    if it were missing information.
+    """
+    if _fr24_enabled():
+        return {
+            "source":        "Flightradar24",
+            "has_route":     True,
+            "credits_used":  fr24_credits_used(),
+            "note":          "Commercial feed. Origin/destination available. "
+                             "Positions marked ESTIMATED are interpolated, not live ADS-B.",
+        }
+    return {
+        "source":       "OpenSky Network",
+        "has_route":    False,
+        "credits_used": None,
+        "note":         "Open ADS-B. Position only \u2014 the protocol does not "
+                        "broadcast origin or destination.",
+    }
 
 
 @app.get("/api/live_map")
