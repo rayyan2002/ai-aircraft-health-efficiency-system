@@ -47,3 +47,6 @@ desktop.ini
 dist/
 build/
 *.egg-info/frontend-react/node_modules/
+
+.env
+src/backend/.env

@@ -348,23 +348,40 @@ export default function PakistanFleet() {
       </div>
       )}
 
-      {/* Emissions strip */}
-      {analysis && (
-        <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:12}}>
-          {[
-            {label:'Est. Fuel Burn', value: (analysis.route_and_emissions?.predicted_fuel_liters||0).toLocaleString(), unit:'litres'},
-            {label:'Est. CO₂',       value: (analysis.route_and_emissions?.predicted_co2_kg||0).toLocaleString(),      unit:'kg'},
-            {label:'ADS-B Anomaly',  value: analysis.anomaly_flag ? '⚠ Flagged' : '✓ Normal',
-             unit: `score: ${analysis.iforest_score?.toFixed(4)||'—'}`},
-          ].map(({label,value,unit})=>(
-            <Card key={label}>
-              <Lbl>{label}</Lbl>
-              <div style={{fontFamily:'Orbitron, monospace',fontSize:20,fontWeight:700,color:'#e6edf3'}}>{value}</div>
-              <div style={{fontSize:11,color:'#484f58',marginTop:4}}>{unit}</div>
-            </Card>
-          ))}
-        </div>
-      )}
+      {/* Emissions strip — in-flight quantities only */}
+      {analysis && (() => {
+        const em   = analysis.route_and_emissions || {}
+        const fuel = em.predicted_fuel_liters
+        const co2  = em.predicted_co2_kg
+        // Fuel burn and CO2 are IN-FLIGHT measures. The backend returns null
+        // for a grounded aircraft because it is burning nothing — showing "0"
+        // would imply we measured zero, and showing a number would be false.
+        const groundNote = 'on ground — not burning fuel'
+        return (
+          <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:12}}>
+            {[
+              {label:'Est. Fuel Burn',
+               value: fuel != null ? fuel.toLocaleString() : '—',
+               unit:  fuel != null ? 'litres' : groundNote},
+              {label:'Est. CO₂',
+               value: co2 != null ? co2.toLocaleString() : '—',
+               unit:  co2 != null ? 'kg' : groundNote},
+              {label:'ADS-B Anomaly',
+               value: isAirborne ? (analysis.anomaly_flag ? '⚠ Flagged' : '✓ Normal') : '—',
+               unit:  isAirborne
+                        ? `score: ${analysis.iforest_score?.toFixed(4) ?? '—'}`
+                        : 'no live telemetry to score'},
+            ].map(({label,value,unit})=>(
+              <Card key={label}>
+                <Lbl>{label}</Lbl>
+                <div style={{fontFamily:'Orbitron, monospace',fontSize:20,fontWeight:700,
+                             color: value === '—' ? '#484f58' : '#e6edf3'}}>{value}</div>
+                <div style={{fontSize:11,color:'#484f58',marginTop:4}}>{unit}</div>
+              </Card>
+            ))}
+          </div>
+        )
+      })()}
     </div>
   )
 }

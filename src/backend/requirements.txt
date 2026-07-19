@@ -35,3 +35,4 @@ requests==2.32.2
 # ── Utilities ─────────────────────────────────────────────
 matplotlib==3.9.0
 python-multipart==0.0.9
+python-dotenv
