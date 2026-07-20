@@ -20,6 +20,24 @@ from contextlib import asynccontextmanager
 # 1. PATH CONFIGURATION
 # ──────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))   # src/backend/
+
+# ── Load secrets from .env (never committed) ──────────────────────────
+# Keys live in src/backend/.env, which .gitignore excludes. This must run
+# BEFORE any os.getenv() call that reads a credential.
+#
+# If python-dotenv is not installed the app still works — it just falls back
+# to whatever is already set in the shell environment.
+try:
+    from dotenv import load_dotenv
+    _env_path = os.path.join(BASE_DIR, ".env")
+    if os.path.exists(_env_path):
+        load_dotenv(_env_path)
+        print(f"🔐 Loaded credentials from {_env_path}")
+    else:
+        load_dotenv()   # fall back to any .env up the tree
+except ImportError:
+    print("ℹ️  python-dotenv not installed — reading credentials from the shell "
+          "environment only. (pip install python-dotenv)")
 MODELS_DIR = os.path.join(BASE_DIR, "..", "models")        # src/models/
 
 IF_MODEL_PATH     = os.path.join(MODELS_DIR, "adsb_iforest.pkl")
@@ -918,9 +936,58 @@ def reconcile_opensky_fleet_status():
             ).fetchone()
             cycles = float(frow["total_cycles"]) if frow and frow["total_cycles"] else 15000.0
 
+            # Derive this flight's ACTUAL profile and duration from its own
+            # telemetry, rather than assuming a fixed 30 records for every
+            # aircraft — which made every logged flight burn exactly the same
+            # amount of fuel, an obvious tell that the number was not real.
             alt_last, vel_last = 9000.0, 220.0
-            fuel = round(compute_fuel_burn(alt_last, vel_last, 30), 1)
-            co2  = round(fuel * 2.53, 1)
+            duration_min = None
+            try:
+                hexrow = conn.execute(
+                    "SELECT hex_code FROM fleet WHERE tail_number = ?", (tail,)
+                ).fetchone()
+                if hexrow and hexrow["hex_code"]:
+                    # IMPORTANT: restrict to THIS flight, not every flight that
+                    # ever used this callsign. Callsigns repeat daily — ABQ271
+                    # flies every day — so matching on callsign alone spanned
+                    # six days of telemetry and produced a nonsense duration.
+                    # An 18-hour window safely covers the longest real flight
+                    # while excluding yesterday's leg with the same number.
+                    _win = (_datetime.now() - _timedelta(hours=18)).strftime("%Y-%m-%d %H:%M:%S")
+                    prof = conn.execute("""
+                        SELECT AVG(altitude) AS a, AVG(velocity) AS v,
+                               MIN(timestamp) AS t0, MAX(timestamp) AS t1,
+                               COUNT(*) AS n
+                        FROM flight_telemetry
+                        WHERE UPPER(TRIM(tail_number)) = ?
+                          AND callsign = ?
+                          AND altitude > 0
+                          AND timestamp >= ?
+                    """, (hexrow["hex_code"].strip().upper(), callsign, _win)).fetchone()
+
+                    if prof and prof["n"]:
+                        if prof["a"]:
+                            alt_last = float(prof["a"])
+                        if prof["v"]:
+                            vel_last = float(prof["v"])
+                        # Real elapsed time between first and last sighting.
+                        if prof["t0"] and prof["t1"] and prof["t0"] != prof["t1"]:
+                            t0 = _datetime.fromisoformat(str(prof["t0"]))
+                            t1 = _datetime.fromisoformat(str(prof["t1"]))
+                            mins = (t1 - t0).total_seconds() / 60.0
+                            if 0 < mins < 20 * 60:      # sanity bound
+                                duration_min = mins
+            except Exception:
+                pass
+
+            # compute_fuel_burn works in records x minutes-per-record. Convert
+            # a real duration into that form; fall back to the record count.
+            if duration_min:
+                _units = duration_min / max(1, _poll_interval_min())
+            else:
+                _units = 1
+            fuel = round(compute_fuel_burn(alt_last, vel_last, max(1, _units)), 1)
+            co2  = round(fuel * JET_A1_CO2_KG_PER_LITRE, 1)
 
             final_health = 50.0
             try:
