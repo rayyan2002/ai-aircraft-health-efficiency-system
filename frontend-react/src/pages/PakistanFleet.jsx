@@ -223,19 +223,42 @@ export default function PakistanFleet() {
       </div>
       )}
 
-      {/* Maintenance advisory */}
-      {analysis && (risk==='High' || health < 30) && (
-        <div style={{
-          background:'rgba(248,81,73,0.08)',border:'1px solid #f85149',
-          borderRadius:8,padding:'12px 20px',marginBottom:20,
-          display:'flex',alignItems:'center',gap:10
-        }}>
-          <div style={{width:8,height:8,borderRadius:'50%',background:'#f85149',flexShrink:0}}/>
-          <span style={{fontSize:13,color:'#f85149'}}>
-            Maintenance Advisory — {tail} · RUL: {rul} cycles · Health: {Math.round(health)}/100 · Recommend inspection before next flight.
-          </span>
-        </div>
-      )}
+      {/* Advisory — say WHICH signal fired.
+          Engine wear and live flight anomaly are different concerns and must
+          not be conflated: an aircraft can have a healthy RUL and still be
+          flagged for an unusual flight profile, and citing engine figures for
+          a behaviour alert reads as a contradiction. */}
+      {analysis && (() => {
+        const wearConcern    = (rul != null && rul < 50) || health < 30
+        const anomalyConcern = isAirborne && analysis.anomaly_flag === 1
+        if (!wearConcern && !anomalyConcern) return null
+
+        const col = wearConcern ? '#f85149' : '#d29922'
+        let msg
+        if (wearConcern && anomalyConcern) {
+          msg = `Advisory — ${tail} · Engine wear: RUL ${rul} cycles, health ${Math.round(health)}/100. `
+              + `Live flight profile also flagged as anomalous (score ${analysis.iforest_score?.toFixed(4)}). `
+              + `Recommend inspection.`
+        } else if (wearConcern) {
+          msg = `Engine wear advisory — ${tail} · RUL ${rul} cycles · health ${Math.round(health)}/100 · `
+              + `Prioritise for inspection.`
+        } else {
+          msg = `Flight behaviour advisory — ${tail} · Isolation Forest flagged this flight `
+              + `(score ${analysis.iforest_score?.toFixed(4)}). This reflects flight dynamics, not engine condition — `
+              + `engine wear is normal at RUL ${rul} cycles.`
+        }
+        return (
+          <div style={{
+            background: wearConcern ? 'rgba(248,81,73,0.08)' : 'rgba(210,153,34,0.10)',
+            border:`1px solid ${col}`,
+            borderRadius:8,padding:'12px 20px',marginBottom:20,
+            display:'flex',alignItems:'center',gap:10
+          }}>
+            <div style={{width:8,height:8,borderRadius:'50%',background:col,flexShrink:0}}/>
+            <span style={{fontSize:13,color:col}}>{msg}</span>
+          </div>
+        )
+      })()}
 
       {/* Map + diagnostics */}
       {tail && (
@@ -279,8 +302,24 @@ export default function PakistanFleet() {
           {/* Diagnostics — split honestly by whether the aircraft is flying */}
           <Card style={{flex:1}}>
             <Lbl>
-              {isAirborne ? 'ML Diagnostics — Feature Attribution' : 'Engine Health Diagnostics'}
+              {isAirborne ? 'Flight State Contributions' : 'Engine Health Diagnostics'}
             </Lbl>
+
+            {/* HONEST LABELLING: these are rule-based contributions computed
+                from the current flight state, NOT SHAP values derived from the
+                trained model. Real SHAP analysis of the LSTM lives in
+                SHAP_EXPLAINABILITY.ipynb. Calling this panel "SHAP" would be a
+                claim the code does not support. */}
+            {isAirborne && (
+              <div style={{fontSize:11,color:'#7d8590',marginBottom:12,lineHeight:1.6,
+                           background:'rgba(56,139,253,0.05)',border:'1px solid #21262d',
+                           borderRadius:6,padding:'8px 10px'}}>
+                Rule-based contributions showing how each factor of the current flight
+                state pushes the risk assessment up or down. Negative values increase
+                concern. These are interpretive weights, not SHAP values derived from
+                the trained model.
+              </div>
+            )}
 
             {!isAirborne && (
               <div style={{fontSize:11,color:'#7d8590',marginBottom:12,lineHeight:1.6,

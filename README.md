@@ -129,7 +129,18 @@ export FR24_API_KEY="your_key_here"
 | Variable | Default | Purpose |
 |---|---|---|
 | `FR24_API_KEY` | *(unset)* | Enables Flightradar24. Without it, OpenSky is used. |
+| `OPENWEATHER_API_KEY` | *(unset)* | Airport weather. Skipped if unset. |
 | `PIPELINE_INTERVAL_MIN` | 30 (FR24) / 5 (OpenSky) | Minutes between data-fetch cycles. |
+
+```bash
+# Windows PowerShell
+$env:FR24_API_KEY="..."
+$env:OPENWEATHER_API_KEY="..."
+
+# macOS / Linux
+export FR24_API_KEY="..."
+export OPENWEATHER_API_KEY="..."
+```
 
 **Never commit an API key.** The application reads it from the environment only;
 no key is stored in source. `GET /api/data_source` reports which feed is active.
@@ -168,21 +179,57 @@ scripts are not required for a first run.
 
 ## How the models work
 
-**Engine health (LSTM).** Each fleet aircraft has an accumulated engine-cycle
-count. The LSTM, trained on NASA C-MAPSS, predicts Remaining Useful Life in
-cycles; this is blended with a physical wear model and mapped to a 0–100 health
-score. An aircraft with more accumulated cycles has lower health — the
-relationship is monotonic and verifiable in the database.
+**Engine health (LSTM).** The model is a sequence regressor trained on NASA
+C-MAPSS: 30 timesteps x 24 channels (21 sensors + 3 operational settings),
+predicting Remaining Useful Life in cycles. Test MAE is approximately 6.3 cycles.
 
-**Anomaly detection (Isolation Forest).** Every live ADS-B reading is scored as
-it arrives. The model is unsupervised (no labelled anomalies exist), and it
-detects abnormal *flight behaviour* — not engine condition, since ADS-B carries
-no engine sensor data.
+For a live aircraft we have **no engine sensor data** — ADS-B does not carry it.
+So the system constructs a representative degradation profile from that
+airframe's known accumulated cycles, expressed in the same 30x24 form the model
+was trained on, and the LSTM maps it to an RUL. That output is then blended with
+a direct physical wear model:
+
+```
+wear_fraction = accumulated_cycles / design_life
+wear_rul      = 123 - wear_fraction * (123 - 5)
+final_rul     = 0.30 * lstm_output + 0.70 * wear_rul
+health_score  = (final_rul - 5) / (123 - 5) * 100
+```
+
+The wear model carries the larger weight because accumulated cycles are a **real
+measured quantity** for our fleet, whereas the LSTM was trained on simulated
+engines. This is precisely why the project describes live-fleet RUL as
+*calibrated*, not *validated*.
+
+**Anomaly detection (Isolation Forest).** Unsupervised, trained on four ADS-B
+channels: **ground velocity, barometric altitude, vertical rate, and true
+track**. Every telemetry record is scored at ingest. `score_samples` returns a
+negative value — closer to zero is more normal, more negative is more anomalous.
+
+It is unsupervised because no labelled set of "abnormal flights" exists to train
+against. It detects abnormal *flight behaviour*, not engine condition, since
+those four channels contain no engine information.
 
 **The hex link.** ADS-B gives a callsign, but a callsign is a schedule slot, not
 an airframe. AeroTwin matches the broadcast ICAO 24-bit hex code against the
 fleet registry to identify the specific physical aircraft — and therefore its
 cycle history. All 44 hex codes were verified against Flightradar24.
+
+---
+
+**Fuel and CO2.** Fuel is estimated, not measured:
+
+```
+phase      = f(altitude, airspeed)          # cruise / climb-descent / taxi
+burn_rate  = {cruise: 85, climb_descent: 110, taxi: 45}  # litres/minute
+fuel       = burn_rate * observed_duration
+co2        = fuel * 2.53                    # kg CO2 per litre Jet A-1
+```
+
+The CO2 factor is a published standard: Jet A-1 density ~0.80 kg/L times the
+ICAO emission factor ~3.16 kg CO2 per kg fuel. The **fuel** figure is coarse —
+burn rates are generic rather than per aircraft type, and duration covers only
+the window over which the aircraft was observed.
 
 ---
 

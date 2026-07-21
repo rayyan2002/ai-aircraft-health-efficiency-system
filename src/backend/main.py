@@ -1052,8 +1052,9 @@ def _predict_rul_from_cycles(fleet_cycles, alt, speed):
             val = healthy + (failure - healthy) * w
             val += rng.normal(0, 0.004)
             seq[t, s] = val
-        seq[t, 0] += (alt - 9000) / 60000
-        seq[t, 1] += (speed - 220) / 2000
+        # See note in /api/pak_analyze: RUL depends on accumulated cycles only,
+        # so live flight state does not perturb the sequence. Keeping this
+        # identical in both places is what makes the two pages agree.
     scaled = lstm_scaler.transform(seq)
     raw_rul = float(lstm_model.predict(scaled.reshape(1, 30, 24), verbose=0)[0][0])
     wear_rul = 123 - wear_fraction * (123 - 5)
@@ -1409,16 +1410,22 @@ def compute_dynamic_shap(alt_m: float, speed_ms: float,
     alt_impact     = round(-(alt_norm ** 2) * 15.0, 2)
     speed_impact   = round(-(speed_norm * 12.0), 2) if speed_ms > 250 else round(speed_norm * 3.0, 2)
     anomaly_impact = round(if_score * 8.0, 2)
-    rul_norm       = min(predicted_rul / 200.0, 1.0)
+    # Normalise against the model's real RUL ceiling (123), not an arbitrary
+    # 200 — otherwise a healthy engine never reaches zero wear impact.
+    rul_norm       = min(predicted_rul / 123.0, 1.0)
     wear_impact    = round(-(1.0 - rul_norm) * 10.0, 2)
     phase          = compute_flight_phase(alt_m, speed_ms)
     phase_impact   = {"cruise": 2.0, "climb_descent": -5.0, "taxi_takeoff": -3.0, "grounded": 0.0}[phase]
 
     return [
-        {"feature": "Altitude (m)",                                  "impact": alt_impact},
-        {"feature": "Airspeed (m/s)",                                "impact": speed_impact},
-        {"feature": "ADS-B Anomaly Score",                           "impact": round(anomaly_impact, 2)},
-        {"feature": "Engine Wear (RUL)",                             "impact": wear_impact},
+        {"feature": "Altitude contribution",                         "impact": alt_impact},
+        {"feature": "Airspeed contribution",                         "impact": speed_impact},
+        # NOTE: this is the raw IForest score scaled by 8 so it sits on the
+        # same axis as the other contributions. It is NOT the score itself —
+        # naming it "Score" made it look like it disagreed with the raw value
+        # shown in the Aircraft Info panel.
+        {"feature": "Anomaly contribution",                          "impact": round(anomaly_impact, 2)},
+        {"feature": "Engine wear contribution",                      "impact": wear_impact},
         {"feature": f"Phase: {phase.replace('_', ' ').title()}",     "impact": round(phase_impact, 2)},
     ]
 
@@ -1857,22 +1864,14 @@ def analyze_aircraft_live(tail_number: str, db: Session = Depends(get_db)):
     else:
         risk_level = "Low"
 
-    # ── Is this aircraft actually flying right now? ──
-    # Fuel burn and CO2 are IN-FLIGHT quantities. A parked aircraft is burning
-    # no fuel, so reporting an estimate for it would be meaningless — and a
-    # jury would rightly ask where the number came from.
-    _is_airborne = False
-    try:
-        _c = get_raw_conn()
-        _fs = _c.execute(
-            "SELECT status, last_seen FROM fleet_status WHERE tail_number = ?",
-            (tail_number,)
-        ).fetchone()
-        _c.close()
-        if _fs:
-            _is_airborne = _effective_status(_fs[0], _fs[1]) == "airborne"
-    except Exception:
-        _is_airborne = False
+    # This endpoint serves the LIVE monitor and is keyed by callsign. Anything
+    # reaching it is currently broadcasting ADS-B, so it is airborne by
+    # definition — there is no grounded case to guard against here.
+    #
+    # (The grounded gate belongs in /api/pak_analyze, which is keyed by
+    #  registration and must handle parked aircraft. An earlier patch applied
+    #  it here by mistake, which nulled altitude and airspeed for live flights.)
+    _is_airborne = True
 
     if _is_airborne:
         fuel_litres = compute_fuel_burn(alt, speed, n_records)
@@ -2001,7 +2000,10 @@ def _apply_maintenance_override(tail_number, health_score, predicted_rul, risk_l
             maint_time  = _datetime.fromisoformat(last_maint[0])
             hours_since = (_datetime.now() - maint_time).total_seconds() / 3600
             if hours_since < 72:
-                return 100.0, 200.0, "Low"
+                # Cap at the top of the model's actual RUL range (5-123).
+                # This previously returned 200, which is outside the range the
+                # model can produce and contradicted the documented scale.
+                return 100.0, 123.0, "Low"
     except Exception:
         pass
     return health_score, predicted_rul, risk_level
@@ -2209,9 +2211,9 @@ def get_pakistan_fleet():
 def analyze_pakistan_aircraft(tail_number: str):
     """
     Full ML analysis for a specific fleet aircraft.
-    Queries pakistan_telemetry for real position data.
-    Returns same JSON contract as /api/analyze/{tail_number}
-    but sourced from pakistan_telemetry table.
+    Live telemetry comes from flight_telemetry (keyed by ICAO hex), which is
+    what the FR24/OpenSky pipeline writes to. Returns the same JSON contract
+    as /api/analyze/{tail_number}.
     """
     conn = get_raw_conn()
     try:
@@ -2225,13 +2227,25 @@ def analyze_pakistan_aircraft(tail_number: str):
 
         fleet_row = dict(fleet_row)
 
-        # Get last 30 telemetry records
-        history = conn.execute("""
-            SELECT altitude, velocity, latitude, longitude, timestamp
-            FROM pakistan_telemetry
-            WHERE tail_number = ?
-            ORDER BY id DESC LIMIT 30
-        """, (tail_number,)).fetchall()
+        # Get recent telemetry for THIS airframe.
+        #
+        # This used to read pakistan_telemetry, which is populated by
+        # AviationStack — a feed that returns nothing and is now disabled.
+        # With that table empty, `history` came back empty and the code fell
+        # through to the hardcoded defaults below (9000 m / 220 m/s), so live
+        # aircraft showed invented telemetry.
+        #
+        # Live data lives in flight_telemetry, keyed by ICAO HEX (not
+        # registration), which is why we look the hex up first.
+        _hex = (fleet_row.get("hex_code") or "").strip().upper()
+        history = []
+        if _hex:
+            history = conn.execute("""
+                SELECT altitude, velocity, latitude, longitude, timestamp
+                FROM flight_telemetry
+                WHERE UPPER(TRIM(tail_number)) = ?
+                ORDER BY id DESC LIMIT 30
+            """, (_hex,)).fetchall()
 
     finally:
         conn.close()
@@ -2326,8 +2340,12 @@ def analyze_pakistan_aircraft(tail_number: str):
                         val += rng.normal(0, 0.004)   # small sensor noise
                         seq[t, s] = val
                     # live flight conditions modulate first two channels
-                    seq[t, 0] += (alt - 9000) / 60000
-                    seq[t, 1] += (speed - 220) / 2000
+                    # NOTE: current altitude and airspeed deliberately do NOT
+                    # perturb this sequence. Engine remaining-life is a function
+                    # of accumulated cycles, not of where the aircraft happens
+                    # to be flying right now — and letting live telemetry shift
+                    # it made Pakistan Fleet disagree with Fleet Overview, which
+                    # computes the same aircraft with neutral values.
 
                 scaled = lstm_scaler.transform(seq)
                 raw_rul = float(
@@ -2347,8 +2365,13 @@ def analyze_pakistan_aircraft(tail_number: str):
             except Exception as e:
                 print(f"⚠️ LSTM failed for {tail_number}: {e}")
 
-    # ── Risk ──
-    if predicted_rul < 20 or anomaly_flag == 1:
+    # ── Risk (engine wear only at this point) ──
+    # The live anomaly flag is applied further down, but ONLY if the aircraft
+    # is actually airborne. A parked aircraft reads altitude 0 / speed 0, which
+    # the Isolation Forest correctly finds unusual for flight data — but that
+    # is not a maintenance risk, and it was forcing parked aircraft to "High"
+    # even with a healthy RUL.
+    if predicted_rul < 20:
         risk_level = "High"
     elif predicted_rul < 50:
         risk_level = "Moderate"
@@ -2372,8 +2395,44 @@ def analyze_pakistan_aircraft(tail_number: str):
     except Exception:
         _is_airborne = False
 
+    # A live anomaly escalates risk — but only for an aircraft in flight.
+    if _is_airborne and anomaly_flag == 1:
+        risk_level = "High"
+
     if _is_airborne:
-        fuel_litres = compute_fuel_burn(alt, speed, n_records)
+        # Duration must come from THIS flight, not from a record count.
+        # Using n_records meant every aircraft hit the LIMIT 30 cap and burned
+        # an identical 30 x poll_interval = 7.5 hours, so two different flights
+        # produced the same fuel figure.
+        _units = 1
+        try:
+            _cf = get_raw_conn()
+            _cs = _cf.execute(
+                "SELECT current_callsign FROM fleet_status WHERE tail_number = ?",
+                (tail_number,)).fetchone()
+            _hexr = _cf.execute(
+                "SELECT hex_code FROM fleet WHERE tail_number = ?",
+                (tail_number,)).fetchone()
+            if _cs and _cs[0] and _hexr and _hexr["hex_code"]:
+                _win = (_datetime.now() - _timedelta(hours=18)).strftime("%Y-%m-%d %H:%M:%S")
+                _sp = _cf.execute("""
+                    SELECT MIN(timestamp) AS t0, MAX(timestamp) AS t1, COUNT(*) AS n
+                    FROM flight_telemetry
+                    WHERE UPPER(TRIM(tail_number)) = ?
+                      AND callsign = ?
+                      AND altitude > 0
+                      AND timestamp >= ?
+                """, (_hexr["hex_code"].strip().upper(), _cs[0], _win)).fetchone()
+                if _sp and _sp["n"] and _sp["t0"] and _sp["t1"] and _sp["t0"] != _sp["t1"]:
+                    _mins = (_datetime.fromisoformat(str(_sp["t1"]))
+                             - _datetime.fromisoformat(str(_sp["t0"]))).total_seconds() / 60.0
+                    if 0 < _mins < 20 * 60:
+                        _units = _mins / max(1, _poll_interval_min())
+            _cf.close()
+        except Exception:
+            _units = 1
+
+        fuel_litres = compute_fuel_burn(alt, speed, max(1, _units))
         co2_kg      = round(fuel_litres * JET_A1_CO2_KG_PER_LITRE, 1)
     else:
         fuel_litres = None
@@ -2386,12 +2445,16 @@ def analyze_pakistan_aircraft(tail_number: str):
     wx_source = wx["source"]
 
     health_score = round(min(100, max(0, (predicted_rul - 5) / (123 - 5) * 100)), 1)
-    shap_values  = compute_dynamic_shap(alt, speed, if_score, predicted_rul)
 
     # ── Maintenance override (shared with /api/fleet_health) ──
+    # Applied BEFORE explainability, so the feature contributions describe the
+    # RUL we actually display. Computing SHAP first meant a freshly maintained
+    # aircraft showed a large negative wear impact next to a perfect score.
     health_score, predicted_rul, risk_level = _apply_maintenance_override(
         tail_number, health_score, predicted_rul, risk_level
     )
+
+    shap_values = compute_dynamic_shap(alt, speed, if_score, predicted_rul)
 
     return {
         "tail":                 tail_number,
@@ -2467,14 +2530,21 @@ def get_weather():
 def get_pakistan_route(tail_number: str):
     conn = get_raw_conn()
     try:
-        rows = conn.execute("""
-            SELECT latitude, longitude, altitude, velocity, timestamp
-            FROM pakistan_telemetry
-            WHERE tail_number = ?
-              AND latitude IS NOT NULL
-              AND longitude IS NOT NULL
-            ORDER BY id ASC
-        """, (tail_number,)).fetchall()
+        # flight_telemetry is keyed by ICAO hex, not registration.
+        # (pakistan_telemetry is the disabled AviationStack table.)
+        _hx = conn.execute(
+            "SELECT hex_code FROM fleet WHERE tail_number = ?", (tail_number,)
+        ).fetchone()
+        rows = []
+        if _hx and _hx["hex_code"]:
+            rows = conn.execute("""
+                SELECT latitude, longitude, altitude, velocity, timestamp
+                FROM flight_telemetry
+                WHERE UPPER(TRIM(tail_number)) = ?
+                  AND latitude IS NOT NULL
+                  AND longitude IS NOT NULL
+                ORDER BY id ASC
+            """, (_hx["hex_code"].strip().upper(),)).fetchall()
 
         # ── If no telemetry — return home airport (KHI default) ──
         if not rows:
