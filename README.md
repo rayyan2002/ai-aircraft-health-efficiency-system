@@ -128,9 +128,16 @@ export FR24_API_KEY="your_key_here"
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FR24_API_KEY` | *(unset)* | Enables Flightradar24. Without it, OpenSky is used. |
+| `FR24_API_KEY` | *(unset)* | Enables Flightradar24, polled alongside OpenSky. |
+| `FR24_INTERVAL_MIN` | 30 | Minutes between Flightradar24 polls (billed per aircraft returned). |
+| `PIPELINE_INTERVAL_MIN` | 5 | Minutes between cycles; OpenSky is polled every cycle. |
+| `OPENSKY_CLIENT_ID` / `OPENSKY_CLIENT_SECRET` | *(unset)* | OAuth2 client credentials for a registered OpenSky account. Anonymous access (400 credits/day) runs out after ~11 hours at a 5-minute poll over the Pakistan box. |
 | `OPENWEATHER_API_KEY` | *(unset)* | Airport weather. Skipped if unset. |
-| `PIPELINE_INTERVAL_MIN` | 30 (FR24) / 5 (OpenSky) | Minutes between data-fetch cycles. |
+
+Every `flight_telemetry` row records its feed in `source` (`FR24` / `OpenSky`)
+and how that feed obtained the position in `pos_source` (`ADSB`, `MLAT`,
+`ESTIMATED`, ...). `pipeline_log` records each feed's outcome per cycle
+(`opensky_status`, `fr24_status`), so a failed poll is never read as an empty sky.
 
 ```bash
 # Windows PowerShell
@@ -171,6 +178,7 @@ python scripts/check_hex.py
 | `debug_reconcile.py` | Diagnose airborne/grounded status discrepancies |
 | `Verify_predictions.py` | Sanity-check model outputs |
 | `test_fr24.py` / `diag_fr24.py` / `fr24_fields.py` | Flightradar24 API checks |
+| `fetch_fr24_summaries.py` | Flightradar24 flight summaries (takeoff, landing, route) per fleet registration over a date range; `--count-only` first to see the size |
 
 The database is included in the repository with sample data, so the utility
 scripts are not required for a first run.

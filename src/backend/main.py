@@ -59,21 +59,36 @@ DB_PATH = os.path.join(BASE_DIR, "..", "backend", "aviation_data.db")
 
 def _migrate_flight_telemetry():
     """
-    Add track (heading) and vertical_rate columns if they don't exist.
+    Add columns that later versions need, if they don't exist.
     Safe to run on every startup — SQLite has no 'ADD COLUMN IF NOT EXISTS',
-    so we check pragma first. Existing rows get NULL, which the map handles.
+    so we check pragma first. Existing rows get NULL.
+
+      flight_telemetry.source      feed that produced the row (FR24 / OpenSky)
+      flight_telemetry.pos_source  how that feed obtained the position
+                                   (ADSB, MLAT, ESTIMATED, ...)
+      pipeline_log.*_status        per-feed outcome of each cycle, so a failed
+                                   poll is never mistaken for an empty sky
     """
+    wanted = {
+        "flight_telemetry": (("track", "FLOAT"), ("vertical_rate", "FLOAT"),
+                             ("source", "TEXT"), ("pos_source", "TEXT")),
+        "pipeline_log": (("fr24_saved", "INTEGER"), ("opensky_status", "TEXT"),
+                         ("fr24_status", "TEXT")),
+    }
     try:
         conn = _sqlite3.connect(DB_PATH)
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(flight_telemetry)")}
-        for col, decl in (("track", "FLOAT"), ("vertical_rate", "FLOAT")):
-            if col not in cols:
-                conn.execute(f"ALTER TABLE flight_telemetry ADD COLUMN {col} {decl}")
-                print(f"🛠  [migration] added flight_telemetry.{col}")
+        for table, columns in wanted.items():
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if not cols:
+                continue
+            for col, decl in columns:
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                    print(f"🛠  [migration] added {table}.{col}")
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"⚠️  [migration] flight_telemetry: {e}")
+        print(f"⚠️  [migration] {e}")
 
 
 _migrate_flight_telemetry()
@@ -133,10 +148,48 @@ OPENSKY_PARAMS = {
     "lamax": 37.5, "lomax": 78.0,
 }
 
+OPENSKY_TOKEN_URL = ("https://auth.opensky-network.org/auth/realms/opensky-network"
+                     "/protocol/openid-connect/token")
+OPENSKY_POS_SOURCE = {0: "ADSB", 1: "ASTERIX", 2: "MLAT", 3: "FLARM"}
+_opensky_token = {"value": None, "expires": 0.0}
+
+
+def _opensky_headers(refresh: bool = False) -> dict:
+    """
+    Bearer header for a registered OpenSky account, or {} for anonymous access.
+
+    The Pakistan box is ~246 square degrees, so each /states/all call costs 3
+    credits. Anonymous access allows 400 credits a day (~11 hours at a 5-minute
+    poll); a registered account allows 4,000. OpenSky accepts only OAuth2
+    client credentials: set OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET.
+    """
+    cid = os.getenv("OPENSKY_CLIENT_ID", "").strip()
+    secret = os.getenv("OPENSKY_CLIENT_SECRET", "").strip()
+    if not cid or not secret:
+        return {}
+    import requests as _req
+    import time as _time
+    if refresh or not _opensky_token["value"] or _time.time() >= _opensky_token["expires"]:
+        r = _req.post(OPENSKY_TOKEN_URL, data={
+            "grant_type": "client_credentials",
+            "client_id": cid,
+            "client_secret": secret,
+        }, timeout=15)
+        r.raise_for_status()
+        body = r.json()
+        _opensky_token["value"] = body["access_token"]
+        _opensky_token["expires"] = _time.time() + int(body.get("expires_in", 1800)) - 60
+    return {"Authorization": f"Bearer {_opensky_token['value']}"}
+
+
 def fetch_and_insert_opensky():
     """
     Hits the OpenSky Network API for Pakistan airspace and inserts
     live telemetry into flight_telemetry. Called by the background worker.
+
+    Returns (saved, status). status is 'ok_auth' / 'ok_anon' on success,
+    otherwise the reason nothing was saved, so pipeline_log can tell a failed
+    poll from an empty sky.
     """
     import requests as _req
 
@@ -144,26 +197,34 @@ def fetch_and_insert_opensky():
     print("📡 [OpenSky] Pinging API for Pakistan airspace...")
 
     try:
-        resp = _req.get(url, params=OPENSKY_PARAMS, timeout=15)
+        try:
+            headers = _opensky_headers()
+        except Exception as e:
+            print(f"⚠️ [OpenSky] token request failed ({type(e).__name__}) — using anonymous access.")
+            headers = {}
+        resp = _req.get(url, params=OPENSKY_PARAMS, headers=headers, timeout=15)
+        if resp.status_code == 401 and headers:
+            headers = _opensky_headers(refresh=True)
+            resp = _req.get(url, params=OPENSKY_PARAMS, headers=headers, timeout=15)
+        access = "auth" if headers else "anon"
 
         if resp.status_code == 429:
             print("⚠️ [OpenSky] Rate limit hit — skipping this cycle.")
-            return
+            return 0, f"http_429_{access}"
         if resp.status_code != 200:
             print(f"⚠️ [OpenSky] HTTP {resp.status_code} — skipping.")
-            return
+            return 0, f"http_{resp.status_code}_{access}"
 
         states = resp.json().get("states") or []
         if not states:
             print("⚠️ [OpenSky] No flights in bounding box right now.")
-            return
+            return 0, f"empty_{access}"
 
         conn   = _sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
 
         saved = 0
         anomalies = 0
-        limit = 100
         # ICAO callsign prefixes for Pakistani carriers.
         #   PIA = Pakistan International Airlines
         #   ABQ = airblue
@@ -175,9 +236,6 @@ def fetch_and_insert_opensky():
         PAK_PREFIXES = ("PIA", "ABQ", "SIF", "FJL", "ERD")
 
         for flight in states:
-            if saved >= limit:
-                break
-
             icao24   = str(flight[0]).strip().upper() if flight[0] else "UNKNOWN"
             callsign = str(flight[1]).strip().upper() if flight[1] else "UNKNOWN"
             lon      = flight[5]
@@ -220,13 +278,16 @@ def fetch_and_insert_opensky():
             except Exception:
                 a_flag, a_score = 0, None
 
+            pos_src = OPENSKY_POS_SOURCE.get(flight[16]) if len(flight) > 16 else None
+
             cursor.execute("""
                 INSERT INTO flight_telemetry
                 (tail_number, callsign, altitude, velocity,
-                 latitude, longitude, track, vertical_rate, anomaly_flag, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 latitude, longitude, track, vertical_rate, anomaly_flag, timestamp,
+                 source, pos_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OpenSky', ?)
             """, (icao24, callsign, alt, vel, lat, lon,
-                  track, vrate, a_flag, _datetime.now()))
+                  track, vrate, a_flag, _datetime.now(), pos_src))
             saved += 1
             if a_flag:
                 anomalies += 1
@@ -235,9 +296,11 @@ def fetch_and_insert_opensky():
         conn.close()
         print(f"✅ [OpenSky] Saved {saved} live flights to flight_telemetry "
               f"({anomalies} flagged as anomalous by Isolation Forest).")
+        return saved, f"ok_{access}"
 
     except Exception as e:
         print(f"❌ [OpenSky] Error: {e}")
+        return 0, f"error:{type(e).__name__}"
 
 
 def fetch_and_insert_aviationstack():
@@ -532,16 +595,6 @@ def get_nearest_airport_weather(lat: float, lon: float) -> dict:
 # ──────────────────────────────────────────────────────────────
 # 2. BACKGROUND WORKER
 # ──────────────────────────────────────────────────────────────
-def _get_row_count(table: str) -> int:
-    try:
-        c = _sqlite3.connect(DB_PATH)
-        n = c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        c.close()
-        return n
-    except:
-        return 0
-
-
 # ── Flight-state timing ───────────────────────────────────────────────
 # How long an aircraft may go unseen on ADS-B before we stop calling it
 # airborne. The pipeline runs every 5 minutes and an airborne aircraft should
@@ -556,30 +609,44 @@ def _get_row_count(table: str) -> int:
 #   LOWER  -> more responsive, but aircraft may flicker if OpenSky misses a cycle
 #   HIGHER -> steadier, but landed aircraft linger as airborne
 def _poll_interval_min() -> int:
-    """Minutes between pipeline cycles (see automated_data_pipeline)."""
-    default = 30 if _fr24_enabled() else 5
+    """
+    Minutes between pipeline cycles (see automated_data_pipeline).
+    OpenSky is polled every cycle; Flightradar24 on its own interval.
+    """
     try:
-        return max(1, int(os.getenv("PIPELINE_INTERVAL_MIN", default)))
+        return max(1, int(os.getenv("PIPELINE_INTERVAL_MIN", 5)))
     except ValueError:
-        return default
+        return 5
+
+
+def _fr24_interval_min() -> int:
+    """Minutes between Flightradar24 live polls. FR24 bills per aircraft returned."""
+    try:
+        return max(1, int(os.getenv("FR24_INTERVAL_MIN", 30)))
+    except ValueError:
+        return 30
 
 
 def _airborne_timeout_min() -> int:
     """
     How long an aircraft may go unseen before we stop calling it airborne.
 
-    CRITICAL: this MUST be longer than the poll interval, or aircraft go
-    stale between polls and the whole fleet silently reports "grounded"
-    with no error anywhere.
+    CRITICAL: this MUST be longer than the slowest feed's poll interval, or
+    aircraft go stale between polls and the whole fleet silently reports
+    "grounded" with no error anywhere.
 
     That exact bug shipped: the timeout was a fixed 12 minutes while the
     FR24 poll interval is 30, so for 18 minutes of every 30-minute cycle
     the dashboard showed zero aircraft airborne. Nothing errored, because
     nothing had failed — the data was simply judged stale.
 
-    We therefore allow 2.5 missed cycles, with a 12-minute floor.
+    We therefore allow 2.5 missed polls of the slowest feed, with a
+    12-minute floor.
     """
-    return max(12, int(_poll_interval_min() * 2.5))
+    slowest = _poll_interval_min()
+    if _fr24_enabled():
+        slowest = max(slowest, _fr24_interval_min())
+    return max(12, int(slowest * 2.5))
 
 
 # Kept as a module-level value for anything that reads it directly, but
@@ -687,10 +754,15 @@ def fetch_and_insert_fr24():
     the SAME table and SAME units OpenSky writes to, so reconciliation, the
     Isolation Forest and the map all work unchanged.
 
-    Returns (saved, anomalies).
+    Returns (saved, anomalies, status). status is 'ok', 'partial:<reasons>'
+    when some registration groups failed, or the failure reason.
+
+    The API documents a limit of 15 registrations per request, so the fleet is
+    queried in groups of 15. Credits are charged per aircraft returned, so the
+    split costs nothing extra.
     """
     if not _fr24_enabled():
-        return 0, 0
+        return 0, 0, "disabled"
 
     import requests
 
@@ -702,35 +774,35 @@ def fetch_and_insert_fr24():
             "SELECT tail_number FROM fleet WHERE tail_number IS NOT NULL"
         ).fetchall()]
         if not regs:
-            conn.close()
-            return 0, 0
+            return 0, 0, "no_fleet"
 
-        try:
-            resp = requests.get(
-                f"{FR24_BASE}/live/flight-positions/full",
-                headers=_fr24_headers(),
-                params={"registrations": ",".join(regs)},
-                timeout=(10, 40),
-            )
-        except Exception as e:
-            print(f"⚠️  [FR24] request failed ({type(e).__name__}) — falling back to OpenSky.")
-            conn.close()
-            return 0, 0
+        flights, failures = [], []
+        groups = [regs[i:i + 15] for i in range(0, len(regs), 15)]
+        for group in groups:
+            try:
+                resp = requests.get(
+                    f"{FR24_BASE}/live/flight-positions/full",
+                    headers=_fr24_headers(),
+                    params={"registrations": ",".join(group)},
+                    timeout=(10, 40),
+                )
+            except Exception as e:
+                failures.append(f"error:{type(e).__name__}")
+                continue
+            if resp.status_code != 200:
+                print(f"⚠️  [FR24] HTTP {resp.status_code}: {resp.text[:160]}")
+                failures.append(f"http_{resp.status_code}")
+                continue
+            flights.extend((resp.json() or {}).get("data") or [])
 
-        if resp.status_code == 429:
-            print("⚠️  [FR24] rate limited (10 req/min) — skipping this cycle.")
-            conn.close()
-            return 0, 0
-        if resp.status_code != 200:
-            print(f"⚠️  [FR24] HTTP {resp.status_code}: {resp.text[:160]} — falling back to OpenSky.")
-            conn.close()
-            return 0, 0
+        if len(failures) == len(groups):
+            print(f"⚠️  [FR24] all requests failed ({failures[0]}) — OpenSky data only this cycle.")
+            return 0, 0, failures[0]
+        status = "partial:" + ",".join(failures) if failures else "ok"
 
-        flights = (resp.json() or {}).get("data") or []
         if not flights:
             print("ℹ️  [FR24] no fleet aircraft airborne right now.")
-            conn.close()
-            return 0, 0
+            return 0, 0, status
 
         now = _datetime.now()
         now_s = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -779,10 +851,11 @@ def fetch_and_insert_fr24():
             cur.execute("""
                 INSERT INTO flight_telemetry
                 (tail_number, callsign, altitude, velocity,
-                 latitude, longitude, track, vertical_rate, anomaly_flag, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 latitude, longitude, track, vertical_rate, anomaly_flag, timestamp,
+                 source, pos_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'FR24', ?)
             """, (hexcode, callsign, alt_m, speed_ms, lat, lon,
-                  track, vrate_ms, a_flag, now))
+                  track, vrate_ms, a_flag, now, source or None))
             saved += 1
             if a_flag:
                 anomalies += 1
@@ -825,7 +898,7 @@ def fetch_and_insert_fr24():
         if grounded:
             msg += f", {grounded} on ground skipped"
         print(msg + ").")
-        return saved, anomalies
+        return saved, anomalies, status
 
     finally:
         conn.close()
@@ -1062,12 +1135,24 @@ def _predict_rul_from_cycles(fleet_cycles, alt, speed):
     return max(5.0, min(123.0, rul))
 
 
+_last_fr24_poll = None
+
+
 async def automated_data_pipeline():
-    """Runs every 5 minutes — fetches live data, detects landings, logs every cycle."""
+    """
+    Runs every PIPELINE_INTERVAL_MIN minutes — fetches live data, detects
+    landings, logs every cycle. OpenSky and Flightradar24 run side by side
+    and every row is tagged with its source, so the open feed can be measured
+    against the commercial one.
+    """
+    global _last_fr24_poll
     while True:
         print("🔄 [HEARTBEAT] Running Automated Data Pipeline...")
         cycle_start    = _datetime.now()
         opensky_saved  = 0
+        opensky_status = "not_run"
+        fr24_saved     = 0
+        fr24_status    = "disabled"
         avstack_saved  = 0
         landings_logged= 0
         errors         = []
@@ -1083,32 +1168,30 @@ async def automated_data_pipeline():
             )
             conn_snap.close()
 
-            # ── Step 2a: Flightradar24 (preferred — has ROUTE data) ──
-            # If a key is configured we use FR24, which gives origin and
-            # destination that ADS-B structurally cannot provide, plus far
-            # better coverage over Pakistan. If it is not configured, or the
-            # call fails, we fall through to OpenSky so the system NEVER ends
-            # up with no data.
-            fr24_saved = 0
+            # ── Step 2a: Flightradar24 (reference feed, own interval) ──
             if _fr24_enabled():
-                try:
-                    fr24_saved, _ = await asyncio.get_event_loop().run_in_executor(
-                        None, fetch_and_insert_fr24
-                    )
-                except Exception as e:
-                    errors.append(f"fr24:{e}")
-                    fr24_saved = 0
+                due = (_last_fr24_poll is None or
+                       cycle_start - _last_fr24_poll >= _timedelta(minutes=_fr24_interval_min()))
+                if due:
+                    _last_fr24_poll = cycle_start
+                    try:
+                        fr24_saved, _, fr24_status = await asyncio.get_event_loop().run_in_executor(
+                            None, fetch_and_insert_fr24
+                        )
+                    except Exception as e:
+                        errors.append(f"fr24:{e}")
+                        fr24_status = f"error:{type(e).__name__}"
+                else:
+                    fr24_status = "not_due"
 
-            # ── Step 2: Fetch OpenSky → flight_telemetry ──
-            #   Runs when AirLabs is off OR returned nothing (fallback).
-            opensky_saved = 0
-            if fr24_saved == 0:
-                try:
-                    before = _get_row_count("flight_telemetry")
-                    await asyncio.get_event_loop().run_in_executor(None, fetch_and_insert_opensky)
-                    opensky_saved = _get_row_count("flight_telemetry") - before
-                except Exception as e:
-                    errors.append(f"opensky:{e}")
+            # ── Step 2: OpenSky (open feed, every cycle) ──
+            try:
+                opensky_saved, opensky_status = await asyncio.get_event_loop().run_in_executor(
+                    None, fetch_and_insert_opensky
+                )
+            except Exception as e:
+                errors.append(f"opensky:{e}")
+                opensky_status = f"error:{type(e).__name__}"
 
             # ── Step 2b: HEX-BASED RECONCILIATION (flight lifecycle) ──
             try:
@@ -1176,32 +1259,27 @@ async def automated_data_pipeline():
         error_str = " | ".join(errors) if errors else "none"
         log_line  = (
             f"{cycle_start.strftime('%Y-%m-%d %H:%M:%S')} | "
-            f"opensky={opensky_saved} | avstack={avstack_saved} | "
+            f"opensky={opensky_saved} ({opensky_status}) | "
+            f"fr24={fr24_saved} ({fr24_status}) | "
             f"landings={landings_logged} | errors={error_str} | duration={duration}s"
         )
         print(f"📝 {log_line}")
 
-        # Write to pipeline_log table
         try:
             c = _sqlite3.connect(DB_PATH)
             c.execute("""
                 INSERT INTO pipeline_log
-                (timestamp, opensky_saved, avstack_saved, landings_logged, errors, duration_sec)
-                VALUES (?,?,?,?,?,?)
+                (timestamp, opensky_saved, avstack_saved, landings_logged, errors, duration_sec,
+                 fr24_saved, opensky_status, fr24_status)
+                VALUES (?,?,?,?,?,?,?,?,?)
             """, (cycle_start.isoformat(), opensky_saved, avstack_saved,
-                  landings_logged, error_str, duration))
+                  landings_logged, error_str, duration,
+                  fr24_saved, opensky_status, fr24_status))
             c.commit()
             c.close()
         except Exception as e:
             print(f"⚠️ Log write failed: {e}")
 
-        # Poll interval. FR24 bills per aircraft returned (~6 credits each,
-        # so ~114 credits for our ~19 airborne aircraft). At 60,000 credits a
-        # month that is roughly 500 polls, so a 5-minute interval running all
-        # day would exhaust the plan in under three days. We therefore poll
-        # less often when FR24 is the source. OpenSky is free, so it keeps the
-        # faster cadence.
-        #   Override with:  $env:PIPELINE_INTERVAL_MIN="15"
         _interval = _poll_interval_min()
         print(f"💤 [HEARTBEAT] Sleeping {_interval} minutes "
               f"(airborne timeout {_airborne_timeout_min()} min)...")
@@ -1211,7 +1289,8 @@ async def automated_data_pipeline():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if _fr24_enabled():
-        print("🛰️  DATA SOURCE: Flightradar24 (routes enabled) — OpenSky is the fallback.")
+        print(f"🛰️  DATA SOURCES: OpenSky every {_poll_interval_min()} min + "
+              f"Flightradar24 every {_fr24_interval_min()} min, side by side.")
         _cr = fr24_credits_used()
         if _cr is not None:
             print(f"   FR24 credits used this period: {_cr}")
