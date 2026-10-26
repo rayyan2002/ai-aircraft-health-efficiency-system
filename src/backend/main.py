@@ -31,7 +31,7 @@ try:
     from dotenv import load_dotenv
     _env_path = os.path.join(BASE_DIR, ".env")
     if os.path.exists(_env_path):
-        load_dotenv(_env_path)
+        load_dotenv(_env_path, encoding="utf-8-sig")
         print(f"🔐 Loaded credentials from {_env_path}")
     else:
         load_dotenv()   # fall back to any .env up the tree

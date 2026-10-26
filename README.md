@@ -10,6 +10,13 @@ estimate engine health and detect anomalous flight behaviour in real time.
 > authority. Its predictions assist maintenance and operations decisions; a
 > certified engineer makes the final call. The engine model is calibrated on
 > NASA's benchmark dataset, not validated on real airline maintenance records.
+>
+> Two specifics behind that: the live RUL path derives its model input from the
+> accumulated cycle count rather than from measured engine state, so the LSTM
+> contributes no information independent of the cycle term; and cycle counts in
+> the fleet table are currently seeded from airframe age rather than accumulated
+> from observed flights. Both are documented rather than hidden, and closing them
+> is the subject of current work.
 
 ---
 
@@ -17,8 +24,12 @@ estimate engine health and detect anomalous flight behaviour in real time.
 
 - **Live fleet tracking** — pulls live flight positions and routes, matching each
   flight to a physical aircraft by its ICAO 24-bit transponder hex code.
-- **Engine health / RUL** — an LSTM (trained on NASA C-MAPSS) estimates Remaining
-  Useful Life per airframe from its accumulated engine cycles.
+- **Engine health / RUL** — an LSTM trained on NASA C-MAPSS produces a benchmark
+  RUL estimate. For the live fleet, where no engine sensors are broadcast, the
+  model's 24-channel input is synthesised from the airframe's accumulated cycle
+  count, and the deployed figure blends it with a cycle-based wear term. The
+  result is therefore a wear estimate driven by cycles, not a sensor-driven
+  prognostic — see the scope note.
 - **Anomaly detection** — an Isolation Forest flags abnormal flight behaviour from
   live telemetry (altitude, speed, vertical rate, heading), scored at ingest.
 - **Fleet dashboards** — health overview, predictive maintenance calendar,
@@ -178,7 +189,7 @@ python scripts/check_hex.py
 | `debug_reconcile.py` | Diagnose airborne/grounded status discrepancies |
 | `Verify_predictions.py` | Sanity-check model outputs |
 | `test_fr24.py` / `diag_fr24.py` / `fr24_fields.py` | Flightradar24 API checks |
-| `fetch_fr24_summaries.py` | Flightradar24 flight summaries (takeoff, landing, route) per fleet registration over a date range; `--count-only` first to see the size |
+| `fetch_fr24_summaries.py` | Flightradar24 flight summaries (takeoff, landing, route) per fleet registration over a date range; try one registration first with `--regs` to see the credit cost |
 
 The database is included in the repository with sample data, so the utility
 scripts are not required for a first run.
@@ -189,7 +200,11 @@ scripts are not required for a first run.
 
 **Engine health (LSTM).** The model is a sequence regressor trained on NASA
 C-MAPSS: 30 timesteps x 24 channels (21 sensors + 3 operational settings),
-predicting Remaining Useful Life in cycles. Test MAE is approximately 6.3 cycles.
+predicting Remaining Useful Life in cycles. On the FD001 test set (the last
+30-cycle window of each of the 100 test engines) it reaches RMSE ≈ 15.6 and
+MAE ≈ 11.3 cycles. The normaliser used during training was not saved, so these
+figures were obtained with a reconstructed one. The earlier-quoted 6.3 was the
+validation MAE used for early stopping, not a test result.
 
 For a live aircraft we have **no engine sensor data** — ADS-B does not carry it.
 So the system constructs a representative degradation profile from that
@@ -204,10 +219,11 @@ final_rul     = 0.30 * lstm_output + 0.70 * wear_rul
 health_score  = (final_rul - 5) / (123 - 5) * 100
 ```
 
-The wear model carries the larger weight because accumulated cycles are a **real
-measured quantity** for our fleet, whereas the LSTM was trained on simulated
-engines. This is precisely why the project describes live-fleet RUL as
-*calibrated*, not *validated*.
+The 0.30/0.70 weighting is a design choice and was never tuned or validated.
+Because the LSTM's input is itself built from the cycle count, both terms depend
+on the same single number, and that number is seeded from airframe age rather
+than accumulated from observed flights. This is why the project describes
+live-fleet RUL as *calibrated*, not *validated*.
 
 **Anomaly detection (Isolation Forest).** Unsupervised, trained on four ADS-B
 channels: **ground velocity, barometric altitude, vertical rate, and true

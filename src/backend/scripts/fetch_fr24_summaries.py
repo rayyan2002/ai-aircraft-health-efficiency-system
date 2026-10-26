@@ -11,9 +11,13 @@ range is split into 7-day windows and groups of 15. Summary data starts
 2024-04-07; how far back your plan reaches depends on its tier.
 
 Run from src/backend (dates are UTC, both inclusive):
-    python scripts/fetch_fr24_summaries.py --from 2026-10-20 --to 2026-11-02 --count-only
+    python scripts/fetch_fr24_summaries.py --from 2026-10-20 --to 2026-11-02 --regs AP-BOM
     python scripts/fetch_fr24_summaries.py --from 2026-10-20 --to 2026-11-02
     python scripts/fetch_fr24_summaries.py --from 2026-10-20 --to 2026-11-02 --full
+
+--count-only needs the /flight-summary/count endpoint, which not every plan
+includes. Without it, fetch one registration with --regs first and read the
+credits it reports, then scale up.
 """
 
 import argparse
@@ -31,13 +35,13 @@ DB_PATH = os.path.join(BACKEND, "aviation_data.db")
 BASE = "https://fr24api.flightradar24.com/api"
 GROUP = 15
 WINDOW_DAYS = 7
-PAUSE_S = 7
+PAUSE_S = 12
 
 
 def api_key():
     try:
         from dotenv import load_dotenv
-        load_dotenv(os.path.join(BACKEND, ".env"))
+        load_dotenv(os.path.join(BACKEND, ".env"), encoding="utf-8-sig")
     except ImportError:
         pass
     key = os.getenv("FR24_API_KEY", "").strip()
@@ -131,6 +135,7 @@ def main():
     ap.add_argument("--to", dest="date_to", required=True, help="YYYY-MM-DD (UTC), inclusive")
     ap.add_argument("--full", action="store_true", help="full summaries (runways, distance, flight time)")
     ap.add_argument("--count-only", action="store_true", help="only count matching flights")
+    ap.add_argument("--regs", help="comma-separated registrations (default: whole fleet)")
     args = ap.parse_args()
 
     start = datetime.strptime(args.date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -142,6 +147,12 @@ def main():
     conn = sqlite3.connect(DB_PATH)
     regs = [r[0] for r in conn.execute(
         "SELECT tail_number FROM fleet WHERE tail_number IS NOT NULL ORDER BY tail_number")]
+    if args.regs:
+        wanted = {r.strip().upper() for r in args.regs.split(",") if r.strip()}
+        unknown = wanted - set(regs)
+        if unknown:
+            sys.exit(f"Not in the fleet table: {', '.join(sorted(unknown))}")
+        regs = [r for r in regs if r in wanted]
     groups = [regs[i:i + GROUP] for i in range(0, len(regs), GROUP)]
     detail = "full" if args.full else "light"
     endpoint = "count" if args.count_only else detail
@@ -168,6 +179,10 @@ def main():
                 failures.append(f"{label}: {type(e).__name__}")
                 print(f"  {label}: request failed ({type(e).__name__})")
                 continue
+            if r.status_code == 403:
+                conn.close()
+                hint = " Use --regs with one registration to measure the cost instead." if args.count_only else ""
+                sys.exit(f"HTTP 403 on /flight-summary/{endpoint}: your FR24 plan does not include it.{hint}")
             if r.status_code != 200:
                 failures.append(f"{label}: HTTP {r.status_code}")
                 print(f"  {label}: HTTP {r.status_code} {r.text[:160]}")
